@@ -8,6 +8,7 @@
   "controlStyles[1].target": "StackPanel#SystemTrayFrameGrid, Grid#SystemTrayFrameGrid",
   "controlStyles[1].styles[0]": "Margin=-4,-8,0,0",
   "controlStyles[1].styles[1]": "Padding=5,0,0,0",
+  "controlStyles[1].styles[2]": "CornerRadius=16",
   "controlStyles[2].target": "Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=StartButton] > Taskbar.TaskListButtonPanel#ExperienceToggleButtonRootPanel",
   "controlStyles[2].styles[0]": "Width=53",
   "controlStyles[2].styles[1]": "Padding=2,4,2,4",

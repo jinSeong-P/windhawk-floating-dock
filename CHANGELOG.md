@@ -36,5 +36,7 @@ First public release. Split from a single local mod (0.2 to 0.11.7) into:
   6 DIP of room around the dock so the pop stays inside the click-through
   region. The padding inside the Start button is pinned (Width 53, Padding
   2,4,2,4): Windows widens it by 10 DIP when Explorer starts with left
-  alignment, so switching layouts needs no restart.
+  alignment, so switching layouts needs no restart. The dock and the tray
+  have the same visible corner radius (10 DIP; the tray sets 16 because its
+  background is drawn inside a 12 DIP transparent border).
 - Taskbar height and icon size preset (72 px taskbar, 28 px icons).
