@@ -1,0 +1,22 @@
+{
+  "theme": "DockLike",
+  "clickThroughTaskbar": 1,
+  "controlStyles[0].target": "Taskbar.TaskbarFrame > Grid#RootGrid",
+  "controlStyles[0].styles[0]": "CornerRadius=10",
+  "controlStyles[0].styles[1]": "Margin=6,4,6,12",
+  "controlStyles[0].styles[2]": "Padding=2,0,2,0",
+  "controlStyles[1].target": "StackPanel#SystemTrayFrameGrid, Grid#SystemTrayFrameGrid",
+  "controlStyles[1].styles[0]": "Margin=-4,-8,0,0",
+  "controlStyles[1].styles[1]": "Padding=5,0,0,0",
+  "controlStyles[2].target": "Taskbar.ExperienceToggleButton#LaunchListButton[AutomationProperties.AutomationId=StartButton] > Taskbar.TaskListButtonPanel#ExperienceToggleButtonRootPanel",
+  "controlStyles[2].styles[0]": "Width=53",
+  "controlStyles[2].styles[1]": "Padding=2,4,2,4",
+  "controlStyles[3].target": "SystemTray.Stack#ShowDesktopStack",
+  "controlStyles[3].styles[0]": "Margin=0,-4,-3,-4",
+  "controlStyles[4].target": "Taskbar.TaskbarFrame",
+  "controlStyles[4].styles[0]": "HorizontalAlignment=Left",
+  "controlStyles[4].styles[1]": "Margin=6,0,0,0",
+  "styleConstants[0]": "",
+  "themeResourceVariables[0]": "",
+  "xamlDiagnosticsHandling": "alert"
+}
