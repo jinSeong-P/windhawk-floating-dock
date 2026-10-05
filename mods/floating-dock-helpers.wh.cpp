@@ -2,14 +2,15 @@
 // @id              floating-dock-helpers
 // @name            Floating Dock Helpers
 // @description     macOS-style layout for a floating Windows 11 taskbar (tray next to the centered dock), hot corners for Start and Show desktop, Quick Settings that follows the tray
-// @version         1.0.0
+// @version         1.0.5
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
 // @license         GPL-3.0
 // @include         explorer.exe
+// @include         ShellHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lgdi32 -ladvapi32 -ldwmapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -25,7 +26,8 @@ repository, together with the *Taskbar Auto-Hide Motion* mod.
 
 - **Tray next to the dock (macOS style).** The system tray sits right next to
   the dock and the pair is centered on the screen, following their widths as
-  apps and tray icons come and go. Use it with Windows' center alignment.
+  apps and tray icons come and go. Windows alignment is set to Center for this
+  layout and Left when this layout is disabled.
 - **Hot corners.** A floating dock leaves a gap between the screen corners and
   the Start / Show desktop buttons, so throwing the mouse into a corner no
   longer hits them. While the taskbar is shown, clicking the bottom left
@@ -59,7 +61,7 @@ taskbar mods in the official ramensoftware/windhawk-mods repository.
 /*
 - groupedDock: true
   $name: Tray next to the dock (macOS style)
-  $description: Places the system tray right next to the dock and centers the pair on the screen. Use it with Windows' center alignment.
+  $description: Places the system tray next to the dock. Windows taskbar alignment is automatically Center when enabled, or Left when disabled.
 - groupGapDip: 8
   $name: Gap between dock and tray (DIP)
 - cornerTargets: true
@@ -79,10 +81,13 @@ taskbar mods in the official ramensoftware/windhawk-mods repository.
 #include <cmath>
 #include <cstdarg>
 #include <optional>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
 #include <windows.h>
+#include <dwmapi.h>
+#include <uiautomationcore.h>
 
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
@@ -90,10 +95,364 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Windows.UI.Xaml.Automation.Peers.h>
+#include <winrt/Windows.UI.Xaml.Automation.Provider.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/base.h>
+
+// ShellHost Quick Settings advanced-page Escape adapter.
+
+#include <atomic>
+#include <cwchar>
+#include <initializer_list>
+
+#include <windows.h>
+#include <dwmapi.h>
+#include <windhawk_api.h>
+
+#undef GetCurrentTime
+
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
+
+// Narrow ShellHost-side support for Escape on Quick Settings advanced pages.
+// Include this file in the Windhawk mod translation unit and call
+// InitializeQuickSettingsHost() from Wh_ModInit only in ShellHost.exe.
+// Windhawk applies the registered hooks after Wh_ModInit returns. Call
+// AfterInitQuickSettingsHost() from Wh_ModAfterInit to confirm the trampoline
+// pointers are live, and call UninitializeQuickSettingsHost() from
+// Wh_ModBeforeUninit.
+namespace QsPanelEscape {
+namespace detail {
+
+using OnPreviewKeyDown_t = void (*)(
+    void* page,
+    winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs const& args);
+using NavigateToAdvancedPage_t = void (*)(void* view,
+                                          void* typeName,
+                                          void* advancedPageInfo);
+using ResetAdvancedPageFrame_t = void (*)(void* view);
+using ControlCenterViewDestructor_t = void (*)(void* view);
+using ControlCenterHide_t = void (*)(void* app, void* dismissArgs);
+inline ControlCenterHide_t g_hideOriginal{};
+inline void* g_hideTarget{};
+
+inline OnPreviewKeyDown_t g_onPreviewKeyDownOriginal = nullptr;
+inline NavigateToAdvancedPage_t g_navigateToAdvancedPageOriginal = nullptr;
+inline ResetAdvancedPageFrame_t g_resetAdvancedPageFrameOriginal = nullptr;
+inline ControlCenterViewDestructor_t g_controlCenterViewDestructorOriginal =
+    nullptr;
+
+inline void* g_onPreviewKeyDownTarget = nullptr;
+inline void* g_navigateToAdvancedPageTarget = nullptr;
+inline void* g_resetAdvancedPageFrameTarget = nullptr;
+inline void* g_controlCenterViewDestructorTarget = nullptr;
+
+inline HMODULE g_controlCenterModule = nullptr;
+inline std::atomic<void*> g_advancedView{nullptr};
+inline std::atomic<DWORD> g_advancedViewThreadId{0};
+inline std::atomic<bool> g_enabled{false};
+inline bool g_initialized = false;
+
+constexpr wchar_t kControlCenterWindowClass[] = L"ControlCenterWindow";
+
+constexpr wchar_t kOnPreviewKeyDownSymbol[] =
+    L"?OnPreviewKeyDown@ControlCenterPage@implementation@ControlCenter@winrt@@QEAAXAEBUKeyRoutedEventArgs@Input@Xaml@UI@Windows@4@@Z";
+constexpr wchar_t kNavigateToAdvancedPageSymbol[] =
+    L"?NavigateToAdvancedPage@ControlCenterView@implementation@ControlCenter@winrt@@QEAAXUTypeName@Interop@Xaml@UI@Windows@4@UAdvancedPageInfo@34@@Z";
+constexpr wchar_t kResetAdvancedPageFrameSymbol[] =
+    L"?ResetAdvancedPageFrame@ControlCenterView@implementation@ControlCenter@winrt@@AEAAXXZ";
+constexpr wchar_t kControlCenterViewDestructorSymbol[] =
+    L"??1ControlCenterView@implementation@ControlCenter@winrt@@EEAA@XZ";
+
+bool IsShellHostProcess() {
+    wchar_t imagePath[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, imagePath,
+                                            ARRAYSIZE(imagePath));
+    if (!length || length >= ARRAYSIZE(imagePath)) {
+        return false;
+    }
+
+    const wchar_t* imageName = wcsrchr(imagePath, L'\\');
+    imageName = imageName ? imageName + 1 : imagePath;
+    return _wcsicmp(imageName, L"ShellHost.exe") == 0;
+}
+
+void* FindExactDecoratedSymbol(HMODULE module, PCWSTR decoratedName) {
+    WH_FIND_SYMBOL_OPTIONS options{};
+    options.optionsSize = sizeof(options);
+    options.noUndecoratedSymbols = TRUE;
+
+    WH_FIND_SYMBOL symbol{};
+    HANDLE search = Wh_FindFirstSymbol(module, &options, &symbol);
+    if (!search) {
+        return nullptr;
+    }
+
+    void* address = nullptr;
+    do {
+        if (symbol.symbolDecorated &&
+            wcscmp(symbol.symbolDecorated, decoratedName) == 0) {
+            address = symbol.address;
+            break;
+        }
+    } while (Wh_FindNextSymbol(search, &symbol));
+
+    Wh_FindCloseSymbol(search);
+    return address;
+}
+
+void ClearAdvancedView(void* view) {
+    void* expected = view;
+    if (g_advancedView.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        g_advancedViewThreadId.store(0, std::memory_order_release);
+    }
+}
+
+bool IsForegroundQuickSettingsWindow(DWORD expectedThreadId) {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) {
+        return false;
+    }
+
+    HWND quickSettings = GetAncestor(foreground, GA_ROOTOWNER);
+    if (!quickSettings) {
+        quickSettings = foreground;
+    }
+
+    wchar_t className[64]{};
+    if (!IsWindow(quickSettings) || !IsWindowVisible(quickSettings) ||
+        !GetClassNameW(quickSettings, className, ARRAYSIZE(className)) ||
+        wcscmp(className, kControlCenterWindowClass) != 0) {
+        return false;
+    }
+
+    DWORD processId = 0;
+    const DWORD windowThreadId =
+        GetWindowThreadProcessId(quickSettings, &processId);
+    if (processId != GetCurrentProcessId() ||
+        windowThreadId != expectedThreadId ||
+        GetCurrentThreadId() != expectedThreadId) {
+        return false;
+    }
+
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(quickSettings, DWMWA_CLOAKED,
+                                           &cloaked, sizeof(cloaked))) &&
+           cloaked == 0;
+}
+
+void OnPreviewKeyDownHook(
+    void* page,
+    winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs const& args) {
+    // This event receiver is ControlCenterPage; the navigation controller is
+    // captured separately from ControlCenterView::NavigateToAdvancedPage.
+    // The active view, its UI thread, and the foreground host window together
+    // identify the current Quick Settings session.
+    (void)page;
+
+    if (g_enabled.load(std::memory_order_acquire)) {
+        void* view = g_advancedView.load(std::memory_order_acquire);
+        const DWORD viewThreadId =
+            g_advancedViewThreadId.load(std::memory_order_acquire);
+
+        if (view && viewThreadId && viewThreadId == GetCurrentThreadId() &&
+            IsForegroundQuickSettingsWindow(viewThreadId)) {
+            bool isEscape = false;
+            try {
+                isEscape =
+                    args.Key() == winrt::Windows::System::VirtualKey::Escape;
+            } catch (...) {
+                // Let the native handler process the event if XAML rejects the
+                // argument query.
+            }
+
+            if (isEscape) {
+                try {
+                    // The native back-request handler is a verified tail jump
+                    // to this no-argument frame reset entry point.
+                    g_resetAdvancedPageFrameOriginal(view);
+                    ClearAdvancedView(view);
+                    args.Handled(true);
+                    return;
+                } catch (...) {
+                    // Preserve Windows' native Escape behavior on failure.
+                }
+            }
+        }
+    }
+
+    g_onPreviewKeyDownOriginal(page, args);
+}
+
+void NavigateToAdvancedPageHook(void* view,
+                                void* typeName,
+                                void* advancedPageInfo) {
+    // ControlCenter.dll disassembly confirms the two by-value UDT parameters
+    // arrive indirectly in RDX and R8 on x64. They are forwarded unchanged.
+    g_navigateToAdvancedPageOriginal(view, typeName, advancedPageInfo);
+
+    if (g_enabled.load(std::memory_order_acquire)) {
+        g_advancedViewThreadId.store(GetCurrentThreadId(),
+                                     std::memory_order_relaxed);
+        g_advancedView.store(view, std::memory_order_release);
+    }
+}
+
+void ResetAdvancedPageFrameHook(void* view) {
+    ClearAdvancedView(view);
+    g_resetAdvancedPageFrameOriginal(view);
+}
+
+void ControlCenterViewDestructorHook(void* view) {
+    ClearAdvancedView(view);
+    g_controlCenterViewDestructorOriginal(view);
+}
+
+void ControlCenterHideHook(void* app, void* dismissArgs) {
+    // Public PDB and disassembly confirm the aggregate is indirect in RDX.
+    g_hideOriginal(app, dismissArgs);
+    const DWORD thread = g_advancedViewThreadId.load(std::memory_order_acquire);
+    if (thread == GetCurrentThreadId() && !IsForegroundQuickSettingsWindow(thread)) {
+        g_advancedView.store(nullptr, std::memory_order_release);
+        g_advancedViewThreadId.store(0, std::memory_order_release);
+    }
+}
+
+void RemoveQueuedHooks() {
+    for (void* target : {g_onPreviewKeyDownTarget,
+                         g_navigateToAdvancedPageTarget,
+                         g_resetAdvancedPageFrameTarget,
+                         g_controlCenterViewDestructorTarget, g_hideTarget}) {
+        if (target) {
+            Wh_RemoveFunctionHook(target);
+        }
+    }
+}
+
+}  // namespace detail
+
+inline BOOL InitializeQuickSettingsHost() {
+    using namespace detail;
+
+    if (g_initialized) {
+        return TRUE;
+    }
+    if (!IsShellHostProcess()) {
+        Wh_Log(L"QS Escape: skipped outside ShellHost.exe");
+        return FALSE;
+    }
+
+    HMODULE module = GetModuleHandleW(L"ControlCenter.dll");
+    if (!module) {
+        Wh_Log(L"QS Escape: ControlCenter.dll is not loaded");
+        return FALSE;
+    }
+
+    void* onPreviewKeyDown =
+        FindExactDecoratedSymbol(module, kOnPreviewKeyDownSymbol);
+    void* navigateToAdvancedPage =
+        FindExactDecoratedSymbol(module, kNavigateToAdvancedPageSymbol);
+    void* resetAdvancedPageFrame =
+        FindExactDecoratedSymbol(module, kResetAdvancedPageFrameSymbol);
+    void* controlCenterViewDestructor =
+        FindExactDecoratedSymbol(module, kControlCenterViewDestructorSymbol);
+    void* hide = FindExactDecoratedSymbol(module,
+        L"?Hide@ControlCenterApplication@ControlCenter@winrt@@QEAAXUControlCenterDismissArgs@23@@Z");
+
+    if (!onPreviewKeyDown || !navigateToAdvancedPage ||
+        !resetAdvancedPageFrame || !controlCenterViewDestructor || !hide) {
+        Wh_Log(L"QS Escape: required ControlCenter.dll symbol lookup failed");
+        return FALSE;
+    }
+
+    g_onPreviewKeyDownTarget = onPreviewKeyDown;
+    g_navigateToAdvancedPageTarget = navigateToAdvancedPage;
+    g_resetAdvancedPageFrameTarget = resetAdvancedPageFrame;
+    g_controlCenterViewDestructorTarget = controlCenterViewDestructor;
+    g_hideTarget = hide;
+
+    if (!Wh_SetFunctionHook(
+            onPreviewKeyDown,
+            reinterpret_cast<void*>(OnPreviewKeyDownHook),
+            reinterpret_cast<void**>(&g_onPreviewKeyDownOriginal)) ||
+        !Wh_SetFunctionHook(
+            navigateToAdvancedPage,
+            reinterpret_cast<void*>(NavigateToAdvancedPageHook),
+            reinterpret_cast<void**>(&g_navigateToAdvancedPageOriginal)) ||
+        !Wh_SetFunctionHook(
+            resetAdvancedPageFrame,
+            reinterpret_cast<void*>(ResetAdvancedPageFrameHook),
+            reinterpret_cast<void**>(&g_resetAdvancedPageFrameOriginal)) ||
+        !Wh_SetFunctionHook(
+            controlCenterViewDestructor,
+            reinterpret_cast<void*>(ControlCenterViewDestructorHook),
+            reinterpret_cast<void**>(&g_controlCenterViewDestructorOriginal)) ||
+        !Wh_SetFunctionHook(hide, reinterpret_cast<void*>(ControlCenterHideHook),
+            reinterpret_cast<void**>(&g_hideOriginal))) {
+        RemoveQueuedHooks();
+        g_onPreviewKeyDownTarget = nullptr;
+        g_navigateToAdvancedPageTarget = nullptr;
+        g_resetAdvancedPageFrameTarget = nullptr;
+        g_controlCenterViewDestructorTarget = nullptr;
+        g_hideTarget = nullptr;
+        Wh_Log(L"QS Escape: ControlCenter.dll hook registration failed");
+        return FALSE;
+    }
+
+    g_controlCenterModule = module;
+    g_enabled.store(true, std::memory_order_release);
+    g_initialized = true;
+    Wh_Log(L"QS Escape: registered ShellHost ControlCenter hooks");
+    return TRUE;
+}
+
+inline BOOL AfterInitQuickSettingsHost() {
+    using namespace detail;
+
+    if (!g_initialized || !g_controlCenterModule ||
+        !g_onPreviewKeyDownOriginal || !g_navigateToAdvancedPageOriginal ||
+        !g_resetAdvancedPageFrameOriginal ||
+        !g_controlCenterViewDestructorOriginal) {
+        Wh_Log(L"QS Escape: hook trampolines were not initialized");
+        return FALSE;
+    }
+
+    Wh_Log(L"QS Escape: ControlCenter hooks are active");
+    return TRUE;
+}
+
+inline void UninitializeQuickSettingsHost() {
+    using namespace detail;
+
+    if (!g_initialized) {
+        return;
+    }
+
+    g_enabled.store(false, std::memory_order_release);
+    g_advancedView.store(nullptr, std::memory_order_release);
+    g_advancedViewThreadId.store(0, std::memory_order_release);
+    RemoveQueuedHooks();
+
+    // Keep trampolines intact until Windhawk applies the queued removals after
+    // Wh_ModBeforeUninit returns. A concurrent callback can still need to
+    // forward to the original while teardown is in progress.
+    g_onPreviewKeyDownTarget = nullptr;
+    g_navigateToAdvancedPageTarget = nullptr;
+    g_resetAdvancedPageFrameTarget = nullptr;
+    g_controlCenterViewDestructorTarget = nullptr;
+    g_hideTarget = nullptr;
+    g_controlCenterModule = nullptr;
+    g_initialized = false;
+}
+
+}  // namespace QsPanelEscape
 
 using namespace winrt::Windows::UI::Xaml;
 using winrt::Windows::UI::Xaml::Media::CompositeTransform;
@@ -392,6 +751,41 @@ struct DockParts {
 };
 DockParts g_parts;
 HWND g_taskbar = nullptr;
+bool g_alignmentApplied = false;
+
+void ApplyNativeTaskbarAlignment(HWND taskbar) {
+    if (g_alignmentApplied || !IsWindow(taskbar)) {
+        return;
+    }
+    constexpr wchar_t key[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
+    const DWORD desired = g_settings.groupedDock ? 1 : 0;
+    DWORD current = 0, bytes = sizeof(current);
+    LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, key, L"TaskbarAl",
+        RRF_RT_REG_DWORD, nullptr, &current, &bytes);
+    if (status == ERROR_SUCCESS && current == desired) {
+        g_alignmentApplied = true;
+        return;
+    }
+    status = RegSetKeyValueW(HKEY_CURRENT_USER, key, L"TaskbarAl",
+                             REG_DWORD, &desired, sizeof(desired));
+    if (status != ERROR_SUCCESS) {
+        Trace(L"native alignment write failed: %ld", status);
+        return;
+    }
+    g_alignmentApplied = true;
+    DWORD_PTR notificationResult = 0;
+    SendMessageTimeoutW(taskbar, WM_SETTINGCHANGE, 0,
+        reinterpret_cast<LPARAM>(L"TraySettings"), SMTO_ABORTIFHUNG, 1000,
+        &notificationResult);
+    // This reaches TrayUI::_HandleSettingChange, the same refresh entry used
+    // by the official taskbar-icon-size mod. Merely broadcasting TraySettings
+    // doesn't refresh all of Windows' cached taskbar layout state.
+    PostMessageW(taskbar, WM_SETTINGCHANGE, SPI_SETLOGICALDPIOVERRIDE, 0);
+    Trace(L"native alignment set to %s", desired ? L"center" : L"left");
+}
+
+
 
 void UpdateGroupedLayout(bool syncLayout);
 
@@ -470,7 +864,8 @@ bool FindParts(HWND taskbar) {
 // Finds the parts if they're missing (not found yet, or the taskbar was
 // rebuilt), looking again now and then, not on every call.
 bool EnsureParts() {
-    if (g_parts.root.get() && g_parts.dock.get() && g_parts.tray.get()) {
+    if (g_parts.root.get() && g_parts.dock.get() && g_parts.tray.get() &&
+        g_parts.startButton.get() && g_parts.showDesktop.get()) {
         return true;
     }
     if (GetTickCount64() < g_parts.nextLookup) {
@@ -722,9 +1117,11 @@ constexpr WPARAM kTrayCommandToggleDesktop = 407;
 
 // Start and Show desktop are asked of the taskbar directly. Injected Win key
 // presses (Win, Win+D) were sent but had no effect on 26200.
+void RequestCornerStart();
 void InvokeCorner(CornerKind kind) {
     BOOL posted = FALSE;
     if (kind == CornerKind::Start) {
+        RequestCornerStart();
         posted = PostMessageW(g_taskbar, WM_SYSCOMMAND, SC_TASKLIST, 0);
     } else {
         posted = PostMessageW(g_taskbar, WM_COMMAND, kTrayCommandToggleDesktop,
@@ -994,6 +1391,8 @@ void SyncCornerTargets(HWND taskbar) {
 constexpr wchar_t kQuickSettingsClass[] = L"ControlCenterWindow";
 constexpr int kQuickSettingsChecks = 12;
 constexpr UINT kQuickSettingsCheckMs = 25;
+constexpr UINT kQuickSettingsVisibleCheckMs = 100;
+constexpr wchar_t kQuickSettingsHoldProperty[] = L"FloatingDock.QuickSettingsHoldOpen";
 
 HWINEVENTHOOK g_flyoutShowHook = nullptr;
 HWINEVENTHOOK g_flyoutUncloakHook = nullptr;
@@ -1001,7 +1400,558 @@ HWND g_quickSettings = nullptr;
 UINT_PTR g_quickSettingsTimer = 0;
 int g_quickSettingsChecksLeft = 0;
 
+
+bool IsQuickSettingsVisible(HWND hWnd) {
+    if (!IsWindow(hWnd) || !IsWindowVisible(hWnd)) return false;
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &cloaked,
+                                          sizeof(cloaked))) && !cloaked;
+}
+
+// Included inside the Explorer implementation namespace. All mutable state
+// and callbacks belong to the primary taskbar's XAML dispatcher thread.
+enum class PanelKind { None, Start, Search, Quick, Notifications, Overflow, Menu, TaskView };
+constexpr wchar_t kPanelHold[] = L"FloatingDock.PanelHold.v1";
+constexpr wchar_t kPanelEpoch[] = L"FloatingDock.PanelEpoch.v1";
+constexpr wchar_t kPanelReady[] = L"FloatingDock.PanelBridgeReady.v1";
+struct PanelRecord {
+    HWND window{};
+    DWORD process{}, thread{};
+    PanelKind kind{};
+};
+struct PanelSession {
+    PanelKind current{}, requested{};
+    HWND window{};
+    UINT_PTR epoch{};
+    ULONGLONG deadline{};
+    bool held{};
+};
+PanelSession g_panelSession;
+std::vector<PanelRecord> g_panelRegistry;
+UINT_PTR g_panelTimer{};
+UINT g_panelClosedMessage{};
+winrt::weak_ref<FrameworkElement> g_panelInputRoot;
+Input::PointerEventHandler g_panelPointerHandler{nullptr};
+winrt::Windows::Foundation::IInspectable g_panelHandlerBox{nullptr};
+HHOOK g_panelKeyboardHook{};
+HHOOK g_panelMouseHook{};
+bool g_panelWindowsKey{}, g_panelWindowsChord{};
+bool g_panelReconciling{};
+bool g_trayClicksHooked{};
+bool g_trayClickModuleSeen{};
+struct PendingPanelActivation {
+    winrt::weak_ref<FrameworkElement> button;
+    HWND oldWindow{};
+    UINT_PTR epoch{};
+    bool released{}, closeCompleted{};
+};
+PendingPanelActivation g_pendingPanelActivation;
+
+void CALLBACK PanelCloseCompleted(HWND, UINT, ULONG_PTR epoch, LRESULT) {
+    if (!g_unloading.load() && g_pendingPanelActivation.epoch == epoch)
+        g_pendingPanelActivation.closeCompleted = true;
+}
+
+bool PanelVisible(HWND window) {
+    if (!IsWindow(window) || !IsWindowVisible(window)) return false;
+    DWORD cloak = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloak,
+                                           sizeof(cloak))) && !cloak;
+}
+
+std::wstring PanelProcessName(DWORD pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return {};
+    wchar_t path[MAX_PATH];
+    DWORD length = ARRAYSIZE(path);
+    bool ok = QueryFullProcessImageNameW(process, 0, path, &length);
+    CloseHandle(process);
+    if (!ok) return {};
+    const wchar_t* filename = wcsrchr(path, L'\\');
+    return filename ? filename + 1 : path;
+}
+
+bool PanelPopupOwnedBy(HWND window, HWND owner) {
+    if (!IsWindow(owner)) return false;
+    for (HWND current = GetWindow(window, GW_OWNER); current;
+         current = GetWindow(current, GW_OWNER)) {
+        if (current == owner) return true;
+    }
+    return false;
+}
+
+void DiscoverPanelWindows() {
+    // Validate HWND, PID and thread every reconciliation. A recycled handle
+    // cannot inherit an old record. Unknown CoreWindows are never dismissed.
+    g_panelRegistry.clear();
+    for (HWND window = FindWindowExW(nullptr, nullptr, nullptr, nullptr); window;
+         window = FindWindowExW(nullptr, window, nullptr, nullptr)) {
+        if (!PanelVisible(window)) continue;
+        wchar_t cls[96]{};
+        GetClassNameW(window, cls, ARRAYSIZE(cls));
+        const bool core = !wcscmp(cls, L"Windows.UI.Core.CoreWindow");
+        const bool quick = !wcscmp(cls, L"ControlCenterWindow");
+        const bool overflow = !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland");
+        const bool menu = !wcscmp(cls, L"#32768");
+        if (!core && !quick && !overflow && !menu) continue;
+        DWORD pid{};
+        DWORD thread = GetWindowThreadProcessId(window, &pid);
+        auto process = PanelProcessName(pid);
+        PanelKind kind = PanelKind::None;
+        if (quick && !_wcsicmp(process.c_str(), L"ShellHost.exe")) kind = PanelKind::Quick;
+        else if (overflow && pid == GetCurrentProcessId()) kind = PanelKind::Overflow;
+        else if (core && !_wcsicmp(process.c_str(), L"StartMenuExperienceHost.exe")) kind = PanelKind::Start;
+        else if (core && !_wcsicmp(process.c_str(), L"SearchHost.exe")) kind = PanelKind::Search;
+        else if (core && !_wcsicmp(process.c_str(), L"ShellExperienceHost.exe")) {
+            RECT rect{};
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetWindowRect(window, &rect) && GetMonitorInfoW(
+                    MonitorFromWindow(g_taskbar, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                // Notification host is a narrow, work-area-height right column.
+                // Jump lists share the process/class but have a compact host.
+                const int height = monitor.rcWork.bottom - monitor.rcWork.top;
+                const int width = monitor.rcWork.right - monitor.rcWork.left;
+                RECT taskbarRect{};
+                GetWindowRect(g_taskbar, &taskbarRect);
+                const int taskbarHeight = taskbarRect.bottom - taskbarRect.top;
+                if (rect.top <= monitor.rcWork.top + 2 &&
+                    rect.bottom >= monitor.rcWork.bottom - taskbarHeight - 2 &&
+                    rect.right >= monitor.rcWork.right - 2 &&
+                    rect.right - rect.left < width / 2) kind = PanelKind::Notifications;
+                else if (rect.bottom > rect.top && rect.right > rect.left &&
+                    (g_panelSession.requested == PanelKind::Menu ||
+                     g_panelSession.current == PanelKind::Menu)) kind = PanelKind::Menu;
+            }
+        } else if (menu && pid == GetCurrentProcessId()) {
+            // Explorer owns many unrelated #32768 menus. Count only popups
+            // attached to the active panel/taskbar during a menu transition.
+            const bool menuTransition = g_panelSession.requested == PanelKind::Menu ||
+                                        g_panelSession.current == PanelKind::Menu;
+            const bool attachedToActiveUi =
+                PanelPopupOwnedBy(window, g_panelSession.window) ||
+                PanelPopupOwnedBy(window, g_taskbar);
+            if (attachedToActiveUi &&
+                (menuTransition || g_panelSession.current == PanelKind::Overflow))
+                kind = PanelKind::Menu;
+        }
+        if (kind != PanelKind::None) g_panelRegistry.push_back({window, pid, thread, kind});
+    }
+}
+
+HWND PanelWindow(PanelKind kind) {
+    for (auto const& record : g_panelRegistry) {
+        if (record.kind == kind) return record.window;
+    }
+    return nullptr;
+}
+
+void SetPanelHold(bool hold) {
+    if (!IsWindow(g_taskbar)) return;
+    if (!GetPropW(g_taskbar, kPanelReady)) {
+        // Mixed versions retain the existing Quick Settings bridge only.
+        if (PanelWindow(PanelKind::Quick))
+            SetPropW(g_taskbar, kQuickSettingsHoldProperty, reinterpret_cast<HANDLE>(1));
+        else RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+        return;
+    }
+    RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+    if (hold) {
+        if (!g_panelSession.epoch) g_panelSession.epoch = 1;
+        SetPropW(g_taskbar, kPanelEpoch, reinterpret_cast<HANDLE>(g_panelSession.epoch));
+        SetPropW(g_taskbar, kPanelHold, reinterpret_cast<HANDLE>(g_panelSession.epoch));
+        g_panelSession.held = true;
+    } else if (g_panelSession.held) {
+        RemovePropW(g_taskbar, kPanelHold);
+        g_panelSession.held = false;
+        PostMessageW(g_taskbar, g_panelClosedMessage, g_panelSession.epoch, 0);
+    }
+}
+
+void ReconcilePanels() {
+    if (g_panelReconciling || g_unloading.load()) return;
+    g_panelReconciling = true;
+    DiscoverPanelWindows();
+    PanelKind actual = PanelKind::None;
+    // Prefer the requested target, then the current target; Start's SearchHost
+    // proxy isn't a second visible panel. We never count it beside Start.
+    if (g_panelSession.requested != PanelKind::None &&
+        PanelWindow(g_panelSession.requested)) actual = g_panelSession.requested;
+    else if (PanelWindow(PanelKind::Start)) {
+        actual = (g_panelSession.current == PanelKind::Search && PanelWindow(PanelKind::Search))
+                    ? PanelKind::Search : PanelKind::Start;
+    } else {
+        for (PanelKind kind : {PanelKind::Search, PanelKind::Quick,
+                             PanelKind::Notifications, PanelKind::Overflow, PanelKind::Menu}) {
+            if (PanelWindow(kind)) { actual = kind; break; }
+        }
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_panelSession.requested == PanelKind::TaskView && actual == PanelKind::None) {
+        g_panelSession.requested = PanelKind::None;
+        g_panelSession.deadline = 0;
+    }
+    if (actual == g_panelSession.requested && actual != PanelKind::None) {
+        g_panelSession.requested = PanelKind::None;
+        g_panelSession.deadline = 0;
+    } else if (g_panelSession.deadline && now >= g_panelSession.deadline) {
+        Trace(L"panel transition expired epoch=%llu requested=%d actual=%d",
+              static_cast<unsigned long long>(g_panelSession.epoch),
+              static_cast<int>(g_panelSession.requested), static_cast<int>(actual));
+        g_panelSession.requested = PanelKind::None;
+        g_panelSession.deadline = 0;
+    }
+    if (actual != g_panelSession.current) {
+        Trace(L"panel state epoch=%llu %d -> %d window=%p transition=%d",
+              static_cast<unsigned long long>(g_panelSession.epoch),
+              static_cast<int>(g_panelSession.current), static_cast<int>(actual),
+              PanelWindow(actual), g_panelSession.deadline != 0);
+        if (actual != PanelKind::None && !g_panelSession.held && !g_panelSession.deadline)
+            ++g_panelSession.epoch;
+    }
+    g_panelSession.current = actual;
+    g_panelSession.window = PanelWindow(actual);
+    if (g_panelSession.requested != PanelKind::TaskView)
+        SetPanelHold(actual != PanelKind::None || g_panelSession.deadline != 0);
+    g_panelReconciling = false;
+}
+
+void RequestPanel(PanelKind target) {
+    if (g_unloading.load() || !GetPropW(g_taskbar, kPanelReady)) return;
+    ReconcilePanels();
+    const PanelKind old = g_panelSession.current;
+    if (target == PanelKind::TaskView) {
+        // Full-screen Task View owns the native taskbar policy. This is a
+        // release of our override, not a request to force-hide the taskbar.
+        g_panelSession.requested = target;
+        g_panelSession.deadline = GetTickCount64() + 1000;
+        RemovePropW(g_taskbar, kPanelHold);
+        g_panelSession.held = false;
+        return;
+    }
+    if (old == target) {
+        // Let the native toggle close it; no second toggle and no grace delay.
+        g_panelSession.requested = PanelKind::None;
+        g_panelSession.deadline = 0;
+        return;
+    }
+    ++g_panelSession.epoch;
+    if (!g_panelSession.epoch) ++g_panelSession.epoch;
+    g_panelSession.requested = target;
+    g_panelSession.deadline = GetTickCount64() + 1000;
+    SetPanelHold(true);
+    Trace(L"panel input epoch=%llu old=%d target=%d",
+          static_cast<unsigned long long>(g_panelSession.epoch),
+          static_cast<int>(old), static_cast<int>(target));
+    // Only pre-close when the target's native IconView activation is safely
+    // deferred. Keyboard shortcuts and unrecognized/unhooked tray buttons
+    // keep their native shell behavior.
+    const bool canDeferNativeActivation = g_trayClicksHooked &&
+        g_panelKeyboardHook && g_panelMouseHook &&
+        g_pendingPanelActivation.epoch == g_panelSession.epoch;
+    if (canDeferNativeActivation &&
+        (target == PanelKind::Quick || target == PanelKind::Notifications) &&
+        (old == PanelKind::Start || old == PanelKind::Search)) {
+        if (old == PanelKind::Start && PanelVisible(g_panelSession.window)) {
+            // Same Explorer UI thread, before PointerReleased activates B.
+            SendMessageW(g_taskbar, WM_SYSCOMMAND, SC_TASKLIST, 0);
+        } else if (old == PanelKind::Search && PanelVisible(g_panelSession.window)) {
+            // Exact Search root only; proven not to dismiss the new QS root.
+            if (!SendMessageCallbackW(g_panelSession.window, WM_SYSCOMMAND,
+                                      SC_CLOSE, 0, PanelCloseCompleted, g_panelSession.epoch))
+                g_pendingPanelActivation = {};
+        }
+        if (old == PanelKind::Start && g_pendingPanelActivation.epoch == g_panelSession.epoch)
+            g_pendingPanelActivation.closeCompleted = true;
+    } else if ((target == PanelKind::Quick || target == PanelKind::Notifications) &&
+               (old == PanelKind::Start || old == PanelKind::Search)) {
+        Trace(L"panel native fallback old=%d target=%d: no deferred tray entry",
+              static_cast<int>(old), static_cast<int>(target));
+    }
+}
+
+void CancelPendingPanelActivation(const wchar_t* reason) {
+    const UINT_PTR epoch = g_pendingPanelActivation.epoch;
+    if (!epoch) return;
+    Trace(L"panel deferred activation canceled epoch=%llu reason=%s",
+          static_cast<unsigned long long>(epoch), reason);
+    g_pendingPanelActivation = {};
+    if (epoch == g_panelSession.epoch && g_panelSession.deadline) {
+        g_panelSession.requested = PanelKind::None;
+        g_panelSession.deadline = 0;
+        SetPanelHold(g_panelSession.current != PanelKind::None);
+    }
+}
+
+PanelKind PanelButton(DependencyObject source) {
+    for (int depth = 0; source && depth < 24; ++depth) {
+        if (auto element = source.try_as<FrameworkElement>()) {
+            auto id = Automation::AutomationProperties::GetAutomationId(element);
+            auto name = element.Name();
+            auto cls = winrt::get_class_name(element);
+            if (id == L"StartButton") return PanelKind::Start;
+            if (id == L"SearchButton") return PanelKind::Search;
+            if (id == L"TaskViewButton") return PanelKind::TaskView;
+            if (name == L"ControlCenterButton") return PanelKind::Quick;
+            if (name == L"NotificationCenterButton") return PanelKind::Notifications;
+            if (cls == L"SystemTray.ChevronIconView") return PanelKind::Overflow;
+        }
+        source = VisualTreeHelper::GetParent(source);
+    }
+    return PanelKind::None;
+}
+
+bool PanelContextButton(DependencyObject source) {
+    for (int depth = 0; source && depth < 24; ++depth) {
+        if (auto element = source.try_as<FrameworkElement>()) {
+            auto id = Automation::AutomationProperties::GetAutomationId(element);
+            if (id == L"StartButton" || std::wstring_view(id).starts_with(L"Appid:")) return true;
+        }
+        source = VisualTreeHelper::GetParent(source);
+    }
+    return false;
+}
+
+Automation::Provider::IInvokeProvider PanelInvokeProvider(FrameworkElement const& element) {
+    auto peer = Automation::Peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
+    if (!peer) return nullptr;
+    if (auto outer = peer.try_as<Automation::Provider::IInvokeProvider>()) return outer;
+    auto pattern = peer.GetPattern(Automation::Peers::PatternInterface::Invoke);
+    if (!pattern) return nullptr;
+    Trace(L"panel invoke pattern=%s", winrt::get_class_name(pattern).c_str());
+    if (auto direct = pattern.try_as<Automation::Provider::IInvokeProvider>()) return direct;
+    if (auto boxed = pattern.try_as<winrt::Windows::Foundation::IReference<Automation::Provider::IInvokeProvider>>())
+        return boxed.Value();
+    return nullptr;
+}
+
+FrameworkElement PanelInvokableButton(DependencyObject source) {
+    for (int depth = 0; source && depth < 24; ++depth) {
+        if (auto element = source.try_as<FrameworkElement>()) {
+            if (PanelInvokeProvider(element)) return element;
+        }
+        source = VisualTreeHelper::GetParent(source);
+    }
+    return nullptr;
+}
+
+void CompletePanelActivation() {
+    auto pending = g_pendingPanelActivation;
+    if (!pending.epoch) return;
+    if (pending.epoch != g_panelSession.epoch || !g_panelSession.deadline ||
+        GetTickCount64() >= g_panelSession.deadline) {
+        g_pendingPanelActivation = {};
+        return;
+    }
+    if (!pending.released || !pending.closeCompleted || PanelVisible(pending.oldWindow)) return;
+    // Completion callback confirms the old native command returned. A weak
+    // XAML reference and epoch prevent late callbacks activating a new session.
+    g_pendingPanelActivation = {};
+    if (auto button = pending.button.get()) {
+        try {
+            if (auto invoke = PanelInvokeProvider(button)) {
+                Trace(L"panel deferred activation epoch=%llu", static_cast<unsigned long long>(pending.epoch));
+                invoke.Invoke();
+            }
+        } catch (winrt::hresult_error const& error) {
+            Trace(L"panel invoke failed 0x%08X", static_cast<unsigned>(error.code()));
+        }
+    }
+}
+
+using TrayClickPoint_t = bool (*)(void*, winrt::Windows::Foundation::Point const&, bool, bool, int);
+using TrayClick_t = bool (*)(void*, bool, bool);
+TrayClickPoint_t g_trayClickPointOriginal{};
+TrayClick_t g_trayClickOriginal{};
+
+bool DeferNativeTrayClick(bool right) {
+    if (right || g_unloading.load() || !g_pendingPanelActivation.epoch ||
+        g_pendingPanelActivation.epoch != g_panelSession.epoch ||
+        !OnTaskbarUiThread(g_taskbar)) return false;
+    g_pendingPanelActivation.released = true;
+    Trace(L"panel native activation intercepted epoch=%llu", static_cast<unsigned long long>(g_panelSession.epoch));
+    CompletePanelActivation();
+    return true;
+}
+bool TrayClickPointHook(void* object, winrt::Windows::Foundation::Point const& point,
+                        bool right, bool doubleClick, int device) {
+    if (DeferNativeTrayClick(right)) return true;
+    return g_trayClickPointOriginal(object, point, right, doubleClick, device);
+}
+bool TrayClickHook(void* object, bool right, bool doubleClick) {
+    if (DeferNativeTrayClick(right)) return true;
+    return g_trayClickOriginal(object, right, doubleClick);
+}
+bool HookTrayClicks() {
+    if (g_trayClicksHooked) return true;
+    HMODULE module = GetModuleHandleW(L"SystemTray.dll");
+    if (!module) return false;
+    g_trayClickModuleSeen = true;
+    void* point = QsPanelEscape::detail::FindExactDecoratedSymbol(module,
+        L"?OnClicked@IconView@implementation@SystemTray@winrt@@IEAA_NAEBUPoint@Foundation@Windows@4@_N1W4PointerDeviceType@Input@Devices@74@@Z");
+    void* click = QsPanelEscape::detail::FindExactDecoratedSymbol(module,
+        L"?OnClicked@IconView@implementation@SystemTray@winrt@@QEAA_N_N0@Z");
+    if (!point || !click) return false;
+    if (!Wh_SetFunctionHook(point, reinterpret_cast<void*>(TrayClickPointHook), reinterpret_cast<void**>(&g_trayClickPointOriginal)) ||
+        !Wh_SetFunctionHook(click, reinterpret_cast<void*>(TrayClickHook), reinterpret_cast<void**>(&g_trayClickOriginal))) {
+        Wh_RemoveFunctionHook(point);
+        Wh_RemoveFunctionHook(click);
+        return false;
+    }
+    g_trayClicksHooked = true;
+    Trace(L"panel native tray activation hooks registered");
+    return true;
+}
+
+winrt::Windows::Foundation::IInspectable PanelHandlerInspectable() {
+    return g_panelHandlerBox;
+}
+void AttachPanelInput() {
+    auto root = g_parts.root.get();
+    if (!root || root == g_panelInputRoot.get()) return;
+    if (auto old = g_panelInputRoot.get(); old && g_panelPointerHandler)
+        old.RemoveHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable());
+    g_panelPointerHandler = Input::PointerEventHandler([](auto const&, Input::PointerRoutedEventArgs const& args) {
+        try {
+            if (g_unloading.load()) return;
+            if (g_pendingPanelActivation.epoch)
+                CancelPendingPanelActivation(L"taskbar pointer button");
+            auto root = g_panelInputRoot.get();
+            if (!root) return;
+            auto point = args.GetCurrentPoint(root);
+            PanelKind target = PanelButton(args.OriginalSource().try_as<DependencyObject>());
+            if (point.Properties().IsRightButtonPressed())
+                target = PanelContextButton(args.OriginalSource().try_as<DependencyObject>())
+                            ? PanelKind::Menu : PanelKind::None;
+            if (target != PanelKind::None) {
+                ReconcilePanels();
+                const PanelKind old = g_panelSession.current;
+                if (!point.Properties().IsRightButtonPressed() &&
+                    (old == PanelKind::Start || old == PanelKind::Search) &&
+                    (target == PanelKind::Quick || target == PanelKind::Notifications)) {
+                    auto button = PanelInvokableButton(args.OriginalSource().try_as<DependencyObject>());
+                    if (button && g_trayClicksHooked &&
+                        g_panelKeyboardHook && g_panelMouseHook) {
+                        g_pendingPanelActivation = {winrt::make_weak(button), g_panelSession.window,
+                            g_panelSession.epoch + 1, false, false};
+                        Trace(L"panel native click deferred old=%d target=%d", static_cast<int>(old), static_cast<int>(target));
+                    } else Trace(L"panel defer unavailable button=%d", button != nullptr);
+                }
+                RequestPanel(target);
+            }
+        } catch (winrt::hresult_error const& error) {
+            Trace(L"panel input failed 0x%08X", static_cast<unsigned>(error.code()));
+        }
+    });
+    g_panelHandlerBox = winrt::box_value(g_panelPointerHandler);
+    root.AddHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable(), true);
+    g_panelInputRoot = winrt::make_weak(root);
+    Trace(L"panel input attached root=%p", winrt::get_abi(root));
+}
+
+void CALLBACK PanelTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    if (g_unloading.load()) return;
+    // SystemTray.dll can appear after this Explorer-side helper initializes.
+    // Retry from the taskbar dispatcher once the module is present.
+    if (!g_trayClicksHooked && !g_trayClickModuleSeen &&
+            GetModuleHandleW(L"SystemTray.dll") && HookTrayClicks())
+        Wh_ApplyHookOperations();
+    ReconcilePanels();
+    CompletePanelActivation();
+    try { AttachPanelInput(); } catch (winrt::hresult_error const& error) { Trace(L"panel attach failed 0x%08X %s", static_cast<unsigned>(error.code()), error.message().c_str()); }
+}
+
+void RequestCornerStart() { RequestPanel(PanelKind::Start); }
+
+LRESULT CALLBACK PanelKeyboardProc(int code, WPARAM message, LPARAM data) {
+    if (code == HC_ACTION && !g_unloading.load()) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
+        const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        const bool up = message == WM_KEYUP || message == WM_SYSKEYUP;
+        if (down && key->vkCode == VK_ESCAPE) {
+            CancelPendingPanelActivation(L"Escape");
+        } else if (key->vkCode == VK_LWIN || key->vkCode == VK_RWIN) {
+            if (down) { g_panelWindowsKey = true; g_panelWindowsChord = false; }
+            if (up) {
+                if (g_panelWindowsKey && !g_panelWindowsChord) RequestPanel(PanelKind::Start);
+                g_panelWindowsKey = false;
+            }
+        } else if (down && g_panelWindowsKey) {
+            g_panelWindowsChord = true;
+            PanelKind target = PanelKind::None;
+            if (key->vkCode == 'A') target = PanelKind::Quick;
+            if (key->vkCode == 'N') target = PanelKind::Notifications;
+            if (key->vkCode == 'S') target = PanelKind::Search;
+            if (key->vkCode == 'X') target = PanelKind::Menu;
+            if (key->vkCode == VK_TAB) target = PanelKind::TaskView;
+            if (target != PanelKind::None) RequestPanel(target);
+        }
+    }
+    // Observes intent only. Native input is never swallowed or re-injected.
+    return CallNextHookEx(nullptr, code, message, data);
+}
+
+LRESULT CALLBACK PanelMouseProc(int code, WPARAM message, LPARAM data) {
+    if (code == HC_ACTION && !g_unloading.load() &&
+        (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
+         message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN)) {
+        // The initiating press reaches this hook before XAML creates the
+        // pending activation, so later presses cancel without tracking motion.
+        CancelPendingPanelActivation(L"mouse button");
+    }
+    // Outside input always continues through the native input path.
+    return CallNextHookEx(nullptr, code, message, data);
+}
+
+void StartPanelCoordinator() {
+    if (!g_panelClosedMessage)
+        g_panelClosedMessage = RegisterWindowMessageW(L"FloatingDock.PanelSessionClosed.v1");
+    if (!g_panelTimer) {
+        g_panelSession.epoch = reinterpret_cast<UINT_PTR>(GetPropW(g_taskbar, kPanelEpoch));
+        g_panelTimer = SetTimer(nullptr, 0, 50, PanelTimerProc);
+    }
+    if (!g_trayClicksHooked && !g_trayClickModuleSeen && HookTrayClicks())
+        Wh_ApplyHookOperations();
+    if (!g_panelKeyboardHook) g_panelKeyboardHook = SetWindowsHookExW(
+        WH_KEYBOARD_LL, PanelKeyboardProc, ModuleInstance(), 0);
+    if (!g_panelMouseHook) g_panelMouseHook = SetWindowsHookExW(
+        WH_MOUSE_LL, PanelMouseProc, ModuleInstance(), 0);
+    ReconcilePanels();
+    try { AttachPanelInput(); } catch (winrt::hresult_error const& error) { Trace(L"panel attach failed 0x%08X %s", static_cast<unsigned>(error.code()), error.message().c_str()); }
+}
+
+void StopPanelCoordinator() {
+    if (g_panelKeyboardHook) UnhookWindowsHookEx(g_panelKeyboardHook);
+    g_panelKeyboardHook = nullptr;
+    if (g_panelMouseHook) UnhookWindowsHookEx(g_panelMouseHook);
+    g_panelMouseHook = nullptr;
+    if (g_panelTimer) KillTimer(nullptr, g_panelTimer);
+    g_panelTimer = 0;
+    if (auto root = g_panelInputRoot.get(); root && g_panelPointerHandler)
+        root.RemoveHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable());
+    g_panelInputRoot = {};
+    g_panelPointerHandler = nullptr;
+    g_panelHandlerBox = nullptr;
+    g_pendingPanelActivation = {};
+    // Unload is not evidence that the shell panel closed. Resume native policy
+    // without sending a forced-close notification for a still-open panel.
+    RemovePropW(g_taskbar, kPanelHold);
+    RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+    g_panelRegistry.clear();
+    g_panelSession = {};
+}
+
+void StopQuickSettingsWatch() {
+    if (g_quickSettingsTimer) {
+        KillTimer(nullptr, g_quickSettingsTimer);
+        g_quickSettingsTimer = 0;
+    }
+    g_quickSettings = nullptr;
+    g_quickSettingsChecksLeft = 0;
+
+}
+
 void PlaceQuickSettings(HWND hWnd) {
+    if (!g_settings.groupedDock) return;
     HWND taskbar = g_taskbar;
     RECT rect{};
     MONITORINFO monitorInfo{sizeof(monitorInfo)};
@@ -1030,50 +1980,63 @@ void PlaceQuickSettings(HWND hWnd) {
 // Windows may still place the window while its entrance animation starts;
 // keep it in place for a moment.
 void CALLBACK QuickSettingsTimerProc(HWND, UINT, UINT_PTR, DWORD) {
-    PlaceQuickSettings(g_quickSettings);
-    if (--g_quickSettingsChecksLeft <= 0) {
-        KillTimer(nullptr, g_quickSettingsTimer);
-        g_quickSettingsTimer = 0;
+    if (g_unloading.load(std::memory_order_acquire) ||
+        !IsQuickSettingsVisible(g_quickSettings)) {
+        StopQuickSettingsWatch();
+        return;
+    }
+    // Only the original entrance period adjusts placement. Afterwards this
+    // timer checks visibility, never cursor position or popup coordinates.
+    if (g_quickSettingsChecksLeft > 0) {
+        PlaceQuickSettings(g_quickSettings);
+        if (--g_quickSettingsChecksLeft == 0) {
+            g_quickSettingsTimer = SetTimer(nullptr, g_quickSettingsTimer,
+                kQuickSettingsVisibleCheckMs, QuickSettingsTimerProc);
+        }
     }
 }
 
-void CALLBACK FlyoutEventProc(HWINEVENTHOOK,
-                              DWORD,
-                              HWND hWnd,
-                              LONG idObject,
-                              LONG,
-                              DWORD,
-                              DWORD) {
+void CALLBACK FlyoutEventProc(HWINEVENTHOOK, DWORD event, HWND hWnd,
+                              LONG idObject, LONG, DWORD, DWORD) {
     if (idObject != OBJID_WINDOW || !hWnd ||
-        g_unloading.load(std::memory_order_acquire)) {
+        g_unloading.load(std::memory_order_acquire)) return;
+    if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_CLOAKED ||
+        event == EVENT_OBJECT_DESTROY) {
+        if (hWnd == g_quickSettings) StopQuickSettingsWatch();
         return;
     }
+    if (event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_UNCLOAKED) return;
     WCHAR className[32]{};
     GetClassNameW(hWnd, className, ARRAYSIZE(className));
-    if (wcscmp(className, kQuickSettingsClass) != 0) {
-        return;
+    if (wcscmp(className, kQuickSettingsClass) != 0 ||
+        !IsQuickSettingsVisible(hWnd)) return;
+    if (g_quickSettings != hWnd) {
+        StopQuickSettingsWatch();
+        g_quickSettings = hWnd;
     }
-
-    g_quickSettings = hWnd;
     PlaceQuickSettings(hWnd);
     g_quickSettingsChecksLeft = kQuickSettingsChecks;
-    if (!g_quickSettingsTimer) {
-        g_quickSettingsTimer =
-            SetTimer(nullptr, 0, kQuickSettingsCheckMs, QuickSettingsTimerProc);
-    }
+    g_quickSettingsTimer = SetTimer(nullptr, g_quickSettingsTimer,
+        kQuickSettingsCheckMs, QuickSettingsTimerProc);
 }
 
 // Must run on the taskbar UI thread; the events are delivered there.
 void StartFlyoutPlacement() {
-    if (g_flyoutShowHook || !g_settings.groupedDock) {
+    if (g_flyoutShowHook) {
         return;
     }
-    const DWORD flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-    g_flyoutShowHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+    const DWORD flags = WINEVENT_OUTOFCONTEXT;
+    g_flyoutShowHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
                                        nullptr, FlyoutEventProc, 0, 0, flags);
     g_flyoutUncloakHook =
-        SetWinEventHook(EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr,
+        SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr,
                         FlyoutEventProc, 0, 0, flags);
+    UpdateGroupedLayout(true);
+    if (HWND flyout = FindWindowW(kQuickSettingsClass, nullptr);
+        IsQuickSettingsVisible(flyout)) {
+        FlyoutEventProc(nullptr, EVENT_OBJECT_SHOW, flyout, OBJID_WINDOW,
+                        CHILDID_SELF, 0, GetCurrentThreadId());
+    }
 }
 
 void StopFlyoutPlacement() {
@@ -1083,10 +2046,7 @@ void StopFlyoutPlacement() {
             *hook = nullptr;
         }
     }
-    if (g_quickSettingsTimer) {
-        KillTimer(nullptr, g_quickSettingsTimer);
-        g_quickSettingsTimer = 0;
-    }
+    StopQuickSettingsWatch();
 }
 
 // -----------------------------------------------------------------------------
@@ -1125,10 +2085,12 @@ void StartTaskbarWatch(HWND taskbar) {
         return;
     }
     g_taskbar = taskbar;
+    ApplyNativeTaskbarAlignment(taskbar);
     if (!g_pollTimer) {
         g_pollTimer = SetTimer(nullptr, 0, kPollMs, PollTimerProc);
     }
     StartFlyoutPlacement();
+    StartPanelCoordinator();
 }
 
 using TrayUI_SlideWindow_t = void(WINAPI*)(void* pThis,
@@ -1264,6 +2226,7 @@ void WINAPI CleanupOnUiThread(PVOID) {
         g_pollTimer = 0;
     }
     DestroyCornerTargets();
+    StopPanelCoordinator();
     StopFlyoutPlacement();
     ResetGroupedLayout();
     g_parts = DockParts{};
@@ -1320,20 +2283,85 @@ bool HookTaskbarSymbols() {
 
 }  // namespace
 
+namespace QsHostLoader {
+decltype(&LoadLibraryExW) original{};
+void* target{};
+std::mutex lifecycle;
+std::atomic<bool> stopping{false}, installing{false}, active{false};
+void Activate() {
+    if (installing.exchange(true)) return;
+    {
+        std::lock_guard guard(lifecycle);
+        if (!stopping.load() && GetModuleHandleW(L"ControlCenter.dll") &&
+                QsPanelEscape::InitializeQuickSettingsHost()) {
+            Wh_ApplyHookOperations();
+            QsPanelEscape::AfterInitQuickSettingsHost();
+            active.store(true);
+        }
+    }
+    installing.store(false);
+}
+HMODULE WINAPI LoadLibraryHook(LPCWSTR path, HANDLE file, DWORD flags) {
+    HMODULE module = original(path, file, flags);
+    if (!module || stopping.load() || active.load()) return module;
+    if (GetModuleHandleW(L"ControlCenter.dll")) Activate();
+    return module;
+}
+BOOL Initialize() {
+    stopping.store(false);
+    HMODULE base = GetModuleHandleW(L"kernelbase.dll");
+    target = base ? reinterpret_cast<void*>(GetProcAddress(base, "LoadLibraryExW")) : nullptr;
+    if (!target || !Wh_SetFunctionHook(target,
+            reinterpret_cast<void*>(LoadLibraryHook), reinterpret_cast<void**>(&original))) return FALSE;
+    // ShellHost may receive the mod before its Quick Settings module loads.
+    // Keep the loader hook active, then register exact ControlCenter hooks.
+    if (GetModuleHandleW(L"ControlCenter.dll")) {
+        if (QsPanelEscape::InitializeQuickSettingsHost()) return TRUE;
+        Wh_RemoveFunctionHook(target);
+        target = nullptr;
+        return FALSE;
+    }
+    Wh_Log(L"QS Escape: waiting for ControlCenter.dll");
+    return TRUE;
+}
+void Uninitialize() {
+    stopping.store(true);
+    std::lock_guard guard(lifecycle);
+    if (target) Wh_RemoveFunctionHook(target);
+    target = nullptr;
+    active.store(false);
+    QsPanelEscape::UninitializeQuickSettingsHost();
+}
+}
+
 BOOL Wh_ModInit() {
+    if (QsPanelEscape::detail::IsShellHostProcess())
+        return QsHostLoader::Initialize();
     LoadSettings();
     g_unloading.store(false, std::memory_order_release);
+    // Windhawk may reuse the same mapped DLL during settings reload. Hooks
+    // have been removed by the engine, so registration flags must be reset.
+    g_trayClicksHooked = false;
+    g_trayClickModuleSeen = false;
+    g_alignmentApplied = false;
+    g_panelWindowsKey = false;
+    g_panelWindowsChord = false;
 
     Trace(L"v" WH_MOD_VERSION L" init");
 
     if (!HookTaskbarSymbols()) {
         return FALSE;
     }
+    if (!HookTrayClicks()) Trace(L"panel native tray activation hooks unavailable at init");
 
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    if (QsPanelEscape::detail::IsShellHostProcess()) {
+        QsHostLoader::Activate();
+        return;
+    }
     if (HWND taskbar = FindPrimaryTaskbar()) {
         RunFromWindowThread(GetTaskbarDispatchWindow(taskbar), StartOnUiThread,
                             taskbar);
@@ -1341,6 +2369,10 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModBeforeUninit() {
+    if (QsPanelEscape::detail::IsShellHostProcess()) {
+        QsHostLoader::Uninitialize();
+        return;
+    }
     g_unloading.store(true, std::memory_order_release);
     if (HWND taskbar = g_taskbar ? g_taskbar : FindPrimaryTaskbar()) {
         RunFromWindowThread(GetTaskbarDispatchWindow(taskbar),

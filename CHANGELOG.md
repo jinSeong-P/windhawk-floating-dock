@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.5 (2026-10-06)
+
+- Replace the five dock panels with one click and keep the dock visible
+  throughout panel transitions and child-page interaction.
+- Resume native auto-hide when the final panel closes, preserving the
+  configured animation and hover behavior.
+- Return from Quick Settings Wi-Fi, Bluetooth and audio output subpages
+  with Escape; associate tray menus with their parent panel.
+- Cancel stale deferred activation on outside clicks, Escape or newer input.
+- Support delayed ControlCenter.dll loading and re-register hooks after
+  mod reload; verify Explorer and ShellHost restart behavior.
+- Set Windows alignment automatically to Center for the macOS layout and
+  Left when that layout is disabled.
+- Keep shortcut entry and Task View on native fallback paths. See
+  [validation and scope](docs/verification-1.0.5.txt).
+
 ## 1.0.0 (2026-10-01)
 
 First public release. Split from a single local mod (0.2 to 0.11.7) into:

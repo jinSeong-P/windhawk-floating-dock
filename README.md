@@ -57,15 +57,36 @@ leave nothing on screen while hidden. Built from two
 4. Install the two mods. For each `.wh.cpp` file in [mods](mods): in Windhawk
    click **Create a New Mod**, replace the whole template with the file's
    contents, click **Compile Mod**, then **Exit Editing Mode**.
-5. Set the Windows alignment for your layout (Settings > Personalization >
-   Taskbar > Taskbar behaviors > Taskbar alignment), and for the left layout
-   turn off *Tray next to the dock* in Floating Dock Helpers.
+5. Choose the layout in Floating Dock Helpers: enable *Tray next to the dock*
+   for mac, or disable it for left. Windows taskbar alignment is set
+   automatically to Center or Left respectively.
 6. Turn on **Automatically hide the taskbar** (same page).
 
 Both presets pin the padding inside the Start button. Windows sets it when
 Explorer starts (10 DIP wider on the left with left alignment), so without
 this the dock would only look right after a sign-out; with it, switching
 layouts takes effect right away.
+
+## Panel behavior (1.0.5)
+
+Install both local mods at version 1.0.5 for the shared panel behavior.
+
+- Clicking another dock panel button once replaces Start, Search, Quick
+  Settings, Notifications/calendar or the hidden-icons panel.
+- The dock stays visible while a panel is open, including transitions and
+  Quick Settings subpages. Moving the cursor away does not close it.
+- An outside click or Escape on the main panel closes it and releases the
+  dock to its usual hide animation. Escape in Wi-Fi, Bluetooth or audio
+  output lists returns to the Quick Settings main page.
+- A tray icon's menu stays associated with the hidden-icons panel; Escape
+  closes the menu first. Task View follows Windows' native visibility policy.
+- Enabling the macOS layout sets Windows alignment to Center; disabling it
+  sets alignment to Left. No additional option is required.
+
+These rules were verified for dock button entry on the primary, bottom
+taskbar on build 26200. Keyboard shortcuts such as Win+A/Win+N use Windows'
+native fallback; the single-panel policy is not guaranteed for those entry
+paths. See [verification results](docs/verification-1.0.5.txt).
 
 ## Settings
 

@@ -2,7 +2,7 @@
 // @id              taskbar-autohide-motion
 // @name            Taskbar Auto-Hide Motion
 // @description     Smooth slide and pop for the auto-hidden Windows 11 taskbar, invisible while hidden (OLED friendly), revealed along the whole bottom edge
-// @version         1.0.0
+// @version         1.0.5
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -159,6 +159,18 @@ namespace {
 // TrayUI auto-hide timer ids on Shell_TrayWnd / Shell_SecondaryTrayWnd.
 constexpr UINT_PTR kTrayUITimerHide = 2;
 constexpr UINT_PTR kTrayUITimerUnhide = 3;
+
+constexpr wchar_t kPanelHoldProperty[] = L"FloatingDock.PanelHold.v1";
+constexpr wchar_t kPanelEpochProperty[] = L"FloatingDock.PanelEpoch.v1";
+constexpr wchar_t kPanelBridgeReadyProperty[] =
+    L"FloatingDock.PanelBridgeReady.v1";
+constexpr wchar_t kLegacyQuickSettingsHoldProperty[] =
+    L"FloatingDock.QuickSettingsHoldOpen";
+constexpr wchar_t kPanelSessionClosedMessageName[] =
+    L"FloatingDock.PanelSessionClosed.v1";
+
+// hideDelayMs=0 keeps Windows' default auto-hide delay, approximately 500ms.
+constexpr UINT kDefaultNativeHideDelayMs = 500;
 
 // Delay between committing the hidden HWND position and resetting the
 // translation, so the two never land in the same compositor frame.
@@ -1032,12 +1044,101 @@ struct PendingAnimation {
 
 std::unordered_map<HWND, PendingAnimation> g_pendingAnimations;
 
-// Set while Hide pumps messages inside SlideWindow.
+// Set while Hide pumps messages inside SlideWindow. This is thread-local
+// because taskbar windows can have separate UI threads.
 struct SyncHideState {
     bool active = false;
     bool revealRequested = false;
+    HWND hWnd = nullptr;
+    void* trayUi = nullptr;
+    RECT revealRect{};
+    HMONITOR revealMonitor = nullptr;
 };
-SyncHideState g_syncHide;
+thread_local SyncHideState g_syncHide;
+
+struct SyncHideGuard {
+    explicit SyncHideGuard(HWND hWnd) {
+        g_syncHide = {};
+        g_syncHide.active = true;
+        g_syncHide.hWnd = hWnd;
+    }
+
+    SyncHideGuard(SyncHideGuard const&) = delete;
+    SyncHideGuard& operator=(SyncHideGuard const&) = delete;
+
+    ~SyncHideGuard() {
+        Release();
+    }
+
+    SyncHideState Release() {
+        SyncHideState state = g_syncHide;
+        g_syncHide = {};
+        return state;
+    }
+};
+
+enum class SyncHideWaitResult {
+    Complete,
+    RevealRequested,
+    QuitRequested,
+    Unloading,
+    WaitFailed,
+};
+
+// Keeps the taskbar UI thread responsive while the composition animation runs.
+// WM_QUIT is reposted before returning so the enclosing message loop still sees
+// it; the caller then commits the native hide handoff immediately.
+SyncHideWaitResult WaitForHideAnimation(ULONGLONG start,
+                                        int durationMs,
+                                        bool& rendered) {
+    const ULONGLONG renderDeadline = start + 60;
+    const ULONGLONG deadline = start + durationMs;
+    MSG msg{};
+
+    for (;;) {
+        if (g_unloading.load(std::memory_order_acquire)) {
+            return SyncHideWaitResult::Unloading;
+        }
+        if (g_syncHide.revealRequested) {
+            return SyncHideWaitResult::RevealRequested;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            return SyncHideWaitResult::Complete;
+        }
+
+        ULONGLONG waitMs = deadline - now;
+        if (!rendered && now < renderDeadline) {
+            waitMs = std::min(waitMs, renderDeadline - now);
+        }
+
+        const DWORD waitResult = MsgWaitForMultipleObjectsEx(
+            0, nullptr, static_cast<DWORD>(waitMs), QS_ALLINPUT,
+            MWMO_INPUTAVAILABLE);
+        if (waitResult == WAIT_FAILED) {
+            Trace(L"hide message wait failed: %lu", GetLastError());
+            return SyncHideWaitResult::WaitFailed;
+        }
+
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage(static_cast<int>(msg.wParam));
+                return SyncHideWaitResult::QuitRequested;
+            }
+
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+
+            if (g_unloading.load(std::memory_order_acquire)) {
+                return SyncHideWaitResult::Unloading;
+            }
+            if (g_syncHide.revealRequested) {
+                return SyncHideWaitResult::RevealRequested;
+            }
+        }
+    }
+}
 
 std::optional<PendingKind> PendingKindFor(HWND hWnd) {
     auto it = g_pendingAnimations.find(hWnd);
@@ -1302,9 +1403,11 @@ void Hide(void* pThis,
     // Like the native slide, finish the hide before returning: Explorer treats
     // the taskbar as hidden once SlideWindow returns, and the content vanished
     // mid-animation when this returned early. The animation itself runs in
-    // the compositor, independent of this thread; pump messages only until
-    // XAML has rendered the frame that commits it.
+    // the compositor, independent of this thread; keep pumping messages until
+    // the full duration has elapsed so XAML and Explorer stay responsive.
     const ULONGLONG start = GetTickCount64();
+    SyncHideGuard syncHide(hWnd);
+    SyncHideWaitResult waitResult = SyncHideWaitResult::Complete;
     {
         bool rendered = false;
         winrt::event_token token{};
@@ -1315,18 +1418,7 @@ void Hide(void* pThis,
             rendered = true;
         }
 
-        g_syncHide = SyncHideState{true, false};
-        MSG msg;
-        while (!rendered && GetTickCount64() - start < 60) {
-            MsgWaitForMultipleObjectsEx(0, nullptr, 4, QS_ALLINPUT,
-                                        MWMO_INPUTAVAILABLE);
-            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        const bool revealRequested = g_syncHide.revealRequested;
-        g_syncHide = SyncHideState{};
+        waitResult = WaitForHideAnimation(start, durationMs, rendered);
 
         if (token) {
             try {
@@ -1336,23 +1428,42 @@ void Hide(void* pThis,
             }
         }
 
-        if (revealRequested) {
+        if (waitResult == SyncHideWaitResult::RevealRequested &&
+            !g_unloading.load(std::memory_order_acquire)) {
+            SyncHideState deferredReveal = syncHide.Release();
             // The pointer came back while the hide was being committed. The
             // HWND never moved; reveal from the rendered translation.
             Trace(L"hide reversed during commit");
             g_pendingAnimations[hWnd] = PendingAnimation{
-                PendingKind::HideCommit, 0,       hWnd,
-                pThis,                   *rect,   monitor,
-                winrt::make_weak(element), translation,
+                PendingKind::HideCommit,
+                0,
+                hWnd,
+                pThis,
+                *rect,
+                monitor,
+                winrt::make_weak<UIElement>(element),
+                translation,
             };
-            Reveal(pThis, hWnd, &currentRect, monitor, currentRect, target);
+            RECT revealCurrentRect{};
+            if (!GetWindowRect(hWnd, &revealCurrentRect)) {
+                revealCurrentRect = currentRect;
+            }
+            const RECT& revealRect = deferredReveal.revealRequested
+                                         ? deferredReveal.revealRect
+                                         : currentRect;
+            Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis,
+                   hWnd, &revealRect,
+                   deferredReveal.revealRequested
+                       ? deferredReveal.revealMonitor
+                       : monitor,
+                   revealCurrentRect, target);
             return;
         }
     }
 
-    const int elapsed = static_cast<int>(GetTickCount64() - start);
-    if (elapsed < durationMs) {
-        Sleep(durationMs - elapsed);
+    if (waitResult != SyncHideWaitResult::Complete) {
+        Trace(L"hide wait interrupted (%d); committing the native handoff",
+              static_cast<int>(waitResult));
     }
 
     // The content is at the hidden offset, where only the thin strip is on
@@ -1361,6 +1472,23 @@ void Hide(void* pThis,
     StopAnimation(element, translation);
     SetRestingState(hWnd, element, false);
     TrayUI_SlideWindow_Original(pThis, hWnd, rect, monitor, false, false);
+
+    // A reveal received while the native handoff ran is started from the new
+    // hidden HWND position. Earlier requests were handled before committing.
+    SyncHideState deferredReveal = syncHide.Release();
+    if (deferredReveal.revealRequested &&
+        !g_unloading.load(std::memory_order_acquire)) {
+        RECT revealCurrentRect{};
+        if (!GetWindowRect(hWnd, &revealCurrentRect)) {
+            revealCurrentRect = *rect;
+        }
+        Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis,
+               hWnd, &deferredReveal.revealRect,
+               deferredReveal.revealMonitor ? deferredReveal.revealMonitor
+                                            : monitor,
+               revealCurrentRect, target);
+        return;
+    }
 
     Trace(L"hide %dms from=(%.1f,%.1f), committed after %dms", durationMs,
           from.x, from.y, static_cast<int>(GetTickCount64() - start));
@@ -1393,12 +1521,38 @@ using TrayUI_WndProc_t = LRESULT(WINAPI*)(void* pThis,
                                           bool* handled);
 TrayUI_WndProc_t TrayUI_WndProc_Original = nullptr;
 
+using TrayUI__Hide_t = void(WINAPI*)(void* pThis);
+TrayUI__Hide_t TrayUI__Hide_Original = nullptr;
+
 // The primary taskbar's TrayUI interface that Unhide expects. WndProc and
 // SlideWindow receive the same object through neighboring interfaces (on 26200
 // WndProc's is 8 bytes before Unhide's), so the right one is found by looking
 // for Unhide itself in the vtables around the pointer they receive. Only
 // touched on the taskbar UI thread.
-void* g_trayUi = nullptr;
+std::atomic<void*> g_trayUi{nullptr};
+std::atomic<HWND> g_primaryTaskbar{nullptr};
+std::atomic<DWORD> g_primaryTrayUiThreadId{0};
+std::atomic<UINT> g_panelSessionClosedMessage{0};
+void* g_primaryWndProcThis = nullptr;
+void* g_failedTrayUiLookupThis = nullptr;
+void* g_lastPrimaryHideThis = nullptr;
+void* g_lastPrimaryHideTrayUi = nullptr;
+UINT_PTR g_lastPrimaryHideEpoch = 0;
+UINT_PTR g_primaryTrayUiRevision = 0;
+UINT_PTR g_lastCompletedPanelEpoch = 0;
+
+struct PendingPanelResume {
+    HWND taskbar = nullptr;
+    UINT_PTR timerId = 0;
+    UINT_PTR epoch = 0;
+    UINT_PTR trayUiRevision = 0;
+    void* trayUi = nullptr;
+    void* hideThis = nullptr;
+};
+
+// Accessed only by the primary taskbar UI thread. The close message and the
+// window timer both arrive on that thread.
+PendingPanelResume g_pendingPanelResume;
 HWND g_edgeTaskbar = nullptr;
 UINT_PTR g_edgePollTimer = 0;
 // Set once the unhide was requested for the current visit to the edge.
@@ -1462,15 +1616,12 @@ int VtableSlotOf(const BYTE* object, void* function) {
     return -1;
 }
 
-// WndProc runs for every taskbar message; give up after a few misses.
-int g_trayUiLookupsLeft = 4;
-
-void RecordTrayUi(void* received, const wchar_t* source) {
-    if (g_trayUi || !received || !TrayUI_Unhide_Original ||
-        g_taskbarCode.empty() || g_trayUiLookupsLeft <= 0) {
-        return;
+void* FindTrayUiInterface(void* received,
+                          int* bestOffsetOut = nullptr,
+                          int* bestSlotOut = nullptr) {
+    if (!received || !TrayUI_Unhide_Original || g_taskbarCode.empty()) {
+        return nullptr;
     }
-    g_trayUiLookupsLeft--;
 
     // The interfaces of one object sit next to each other around the one
     // received. An earlier interface's scan can run into the vtable that
@@ -1488,13 +1639,349 @@ void RecordTrayUi(void* received, const wchar_t* source) {
     }
 
     if (bestSlot < 0) {
+        return nullptr;
+    }
+
+    if (bestOffsetOut) {
+        *bestOffsetOut = bestOffset;
+    }
+    if (bestSlotOut) {
+        *bestSlotOut = bestSlot;
+    }
+    return const_cast<BYTE*>(bytes + bestOffset);
+}
+
+bool IsPrimaryTaskbarWindow(HWND hWnd) {
+    if (!hWnd) {
+        return false;
+    }
+
+    HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (primaryTaskbar && primaryTaskbar == hWnd) {
+        return true;
+    }
+
+    return g_primaryTaskbar.load(std::memory_order_acquire) == hWnd;
+}
+
+bool IsTrayUiPointerFor(void* candidate, void* trayUi) {
+    if (!candidate || !trayUi) {
+        return false;
+    }
+
+    if (FindTrayUiInterface(candidate) == trayUi) {
+        return true;
+    }
+
+    // Some private TrayUI methods use a neighboring interface subobject whose
+    // vtable does not contain Unhide. Their `this` pointers still sit within
+    // the adjacent-interface block that RecordTrayUi already validated.
+    const uintptr_t candidateAddress = reinterpret_cast<uintptr_t>(candidate);
+    const uintptr_t trayUiAddress = reinterpret_cast<uintptr_t>(trayUi);
+    const uintptr_t distance = candidateAddress > trayUiAddress
+                                   ? candidateAddress - trayUiAddress
+                                   : trayUiAddress - candidateAddress;
+    return distance <= 0x40 && distance % sizeof(void*) == 0;
+}
+
+void CancelPendingPanelResume(const wchar_t* reason) {
+    if (!g_pendingPanelResume.timerId) {
+        g_pendingPanelResume = {};
+        return;
+    }
+
+    KillTimer(nullptr, g_pendingPanelResume.timerId);
+    Trace(L"panel bridge: cancel epoch=%llu (%s)",
+          static_cast<unsigned long long>(g_pendingPanelResume.epoch), reason);
+    g_pendingPanelResume = {};
+}
+
+void ResetPrimaryTrayUi(HWND taskbar, const wchar_t* reason) {
+    if (g_pendingPanelResume.taskbar == taskbar) {
+        CancelPendingPanelResume(reason);
+    }
+
+    if (g_primaryTaskbar.load(std::memory_order_acquire) == taskbar) {
+        RemovePropW(taskbar, kPanelBridgeReadyProperty);
+        g_trayUi.store(nullptr, std::memory_order_release);
+        g_primaryTaskbar.store(nullptr, std::memory_order_release);
+        g_primaryTrayUiThreadId.store(0, std::memory_order_release);
+        g_primaryWndProcThis = nullptr;
+        g_failedTrayUiLookupThis = nullptr;
+        g_lastPrimaryHideThis = nullptr;
+        g_lastPrimaryHideTrayUi = nullptr;
+        g_lastPrimaryHideEpoch = 0;
+        g_lastCompletedPanelEpoch = 0;
+        g_primaryTrayUiRevision++;
+        Trace(L"panel bridge: primary TrayUI context cleared (%s)", reason);
+    }
+}
+
+void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
+    if (!received || !TrayUI_Unhide_Original || g_taskbarCode.empty() ||
+        !IsPrimaryTaskbarWindow(taskbar)) {
+        return;
+    }
+
+    DWORD pid = 0;
+    DWORD threadId = GetWindowThreadProcessId(taskbar, &pid);
+    if (pid != GetCurrentProcessId() || threadId != GetCurrentThreadId()) {
+        return;
+    }
+
+    const bool fromWndProc = _wcsicmp(source, L"WndProc") == 0;
+    void* currentTrayUi = g_trayUi.load(std::memory_order_acquire);
+    if (fromWndProc && received == g_primaryWndProcThis && currentTrayUi &&
+        g_primaryTaskbar.load(std::memory_order_acquire) == taskbar &&
+        g_primaryTrayUiThreadId.load(std::memory_order_acquire) == threadId) {
+        if (!g_unloading.load(std::memory_order_acquire) &&
+            !GetPropW(taskbar, kPanelBridgeReadyProperty) &&
+            g_panelSessionClosedMessage.load(std::memory_order_acquire) &&
+            TrayUI__Hide_Original && TrayUI_WndProc_Original) {
+            if (SetPropW(taskbar, kPanelBridgeReadyProperty,
+                         reinterpret_cast<HANDLE>(1))) {
+                Trace(L"panel bridge: ready on primary taskbar %p", taskbar);
+            }
+        }
+        return;
+    }
+
+    if (fromWndProc && received == g_failedTrayUiLookupThis) {
+        return;
+    }
+
+    if (!fromWndProc && currentTrayUi &&
+        g_primaryTaskbar.load(std::memory_order_acquire) == taskbar &&
+        g_primaryTrayUiThreadId.load(std::memory_order_acquire) == threadId) {
+        return;
+    }
+
+    int bestOffset = 0;
+    int bestSlot = -1;
+    void* trayUi = FindTrayUiInterface(received, &bestOffset, &bestSlot);
+    if (!trayUi) {
+        if (fromWndProc && received != g_primaryWndProcThis && currentTrayUi) {
+            ResetPrimaryTrayUi(taskbar, L"primary TrayUI interface changed");
+        }
+        if (fromWndProc) {
+            g_failedTrayUiLookupThis = received;
+        }
         Trace(L"TrayUI from %s: %p has no Unhide interface nearby", source,
               received);
         return;
     }
-    g_trayUi = const_cast<BYTE*>(bytes + bestOffset);
-    Trace(L"TrayUI from %s: %p, Unhide interface at %+d (slot %d)", source,
-          received, bestOffset, bestSlot);
+
+    bool contextChanged =
+        currentTrayUi != trayUi ||
+        g_primaryTaskbar.load(std::memory_order_acquire) != taskbar ||
+        g_primaryTrayUiThreadId.load(std::memory_order_acquire) != threadId;
+    if (fromWndProc && g_primaryWndProcThis &&
+        g_primaryWndProcThis != received) {
+        contextChanged = true;
+    }
+
+    if (contextChanged) {
+        CancelPendingPanelResume(L"primary TrayUI context changed");
+        g_primaryTrayUiRevision++;
+        g_lastPrimaryHideThis = nullptr;
+        g_lastPrimaryHideTrayUi = nullptr;
+        g_lastPrimaryHideEpoch = 0;
+        g_lastCompletedPanelEpoch = 0;
+        g_failedTrayUiLookupThis = nullptr;
+        Trace(L"TrayUI from %s: %p, Unhide interface at %+d (slot %d), "
+              L"primary context=%llu",
+              source, received, bestOffset, bestSlot,
+              static_cast<unsigned long long>(g_primaryTrayUiRevision));
+    }
+
+    g_trayUi.store(trayUi, std::memory_order_release);
+    g_primaryTaskbar.store(taskbar, std::memory_order_release);
+    g_primaryTrayUiThreadId.store(threadId, std::memory_order_release);
+    if (fromWndProc) {
+        g_primaryWndProcThis = received;
+    }
+
+    if (fromWndProc && !g_unloading.load(std::memory_order_acquire) &&
+        g_panelSessionClosedMessage.load(std::memory_order_acquire) &&
+        TrayUI__Hide_Original && TrayUI_WndProc_Original &&
+        !GetPropW(taskbar, kPanelBridgeReadyProperty) &&
+        SetPropW(taskbar, kPanelBridgeReadyProperty,
+                 reinterpret_cast<HANDLE>(1))) {
+        Trace(L"panel bridge: ready on primary taskbar %p", taskbar);
+    }
+}
+
+bool HasPanelHold(HWND taskbar) {
+    return GetPropW(taskbar, kPanelHoldProperty) != nullptr ||
+           GetPropW(taskbar, kLegacyQuickSettingsHoldProperty) != nullptr;
+}
+
+bool IsCurrentUnheldPanelEpoch(HWND taskbar, UINT_PTR epoch) {
+    if (!taskbar || !epoch || !IsPrimaryTaskbarWindow(taskbar) ||
+        g_primaryTaskbar.load(std::memory_order_acquire) != taskbar ||
+        GetPropW(taskbar, kPanelEpochProperty) !=
+            reinterpret_cast<HANDLE>(epoch) ||
+        HasPanelHold(taskbar)) {
+        return false;
+    }
+
+    return true;
+}
+
+LRESULT CompletePanelResume(void* wndProcThis,
+                            HWND taskbar,
+                            UINT_PTR timerId) {
+    PendingPanelResume pending = g_pendingPanelResume;
+    if (!pending.timerId || pending.timerId != timerId ||
+        pending.taskbar != taskbar) {
+        return 0;
+    }
+
+    KillTimer(nullptr, timerId);
+    g_pendingPanelResume = {};
+
+    void* trayUi = g_trayUi.load(std::memory_order_acquire);
+    DWORD pid = 0;
+    DWORD windowThread = GetWindowThreadProcessId(taskbar, &pid);
+    const bool currentContext =
+        !g_unloading.load(std::memory_order_acquire) &&
+        pid == GetCurrentProcessId() && taskbar == FindWindowW(L"Shell_TrayWnd", nullptr) &&
+        windowThread == GetCurrentThreadId() && TrayUI__Hide_Original &&
+        windowThread == g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
+        pending.trayUiRevision == g_primaryTrayUiRevision &&
+        pending.trayUi == trayUi &&
+        pending.hideThis && IsTrayUiPointerFor(pending.hideThis, trayUi) &&
+        IsTrayUiPointerFor(wndProcThis, trayUi);
+    const bool currentEpoch =
+        IsCurrentUnheldPanelEpoch(taskbar, pending.epoch);
+    if (!currentContext || !currentEpoch) {
+        Trace(L"panel bridge: resume expired epoch=%llu context=%d epochValid=%d",
+              static_cast<unsigned long long>(pending.epoch), currentContext,
+              currentEpoch);
+        return 0;
+    }
+
+    if (pending.epoch == g_lastCompletedPanelEpoch) {
+        Trace(L"panel bridge: duplicate resume ignored epoch=%llu",
+              static_cast<unsigned long long>(pending.epoch));
+        return 0;
+    }
+
+    POINT cursor{};
+    if (GetCursorPos(&cursor)) {
+        HWND hit = WindowFromPoint(cursor);
+        if (hit && GetAncestor(hit, GA_ROOT) == taskbar) {
+            // A fresh interaction with the visible dock supersedes the old
+            // panel-close request. Native leave handling will hide it later.
+            g_lastCompletedPanelEpoch = pending.epoch;
+            Trace(L"panel bridge: resume cancelled by dock interaction");
+            return 0;
+        }
+    }
+
+    if (IsTaskbarHiddenOnScreen(taskbar) ||
+        PendingKindFor(taskbar) == PendingKind::HideCommit) {
+        g_lastCompletedPanelEpoch = pending.epoch;
+        Trace(L"panel bridge: native hide already in progress epoch=%llu",
+              static_cast<unsigned long long>(pending.epoch));
+        return 0;
+    }
+
+    // Mark before entering native code because _Hide may pump the taskbar
+    // message queue and deliver a duplicate session-close message reentrantly.
+    g_lastCompletedPanelEpoch = pending.epoch;
+    void* hideThis = pending.hideThis;
+    Trace(L"panel bridge: resume native _Hide epoch=%llu this=%p",
+          static_cast<unsigned long long>(pending.epoch), hideThis);
+    TrayUI__Hide_Original(hideThis);
+    return 0;
+}
+
+void CALLBACK PanelResumeTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
+    if (g_pendingPanelResume.timerId == timer)
+        CompletePanelResume(g_primaryWndProcThis, g_pendingPanelResume.taskbar, timer);
+}
+LRESULT HandlePanelSessionClosed(void* wndProcThis,
+                                 HWND taskbar,
+                                 WPARAM wParam,
+                                 LPARAM lParam) {
+    DWORD pid = 0;
+    DWORD windowThread = GetWindowThreadProcessId(taskbar, &pid);
+    UINT_PTR epoch = static_cast<UINT_PTR>(wParam);
+    void* trayUi = g_trayUi.load(std::memory_order_acquire);
+    const bool validTarget =
+        !g_unloading.load(std::memory_order_acquire) && lParam == 0 && epoch &&
+        pid == GetCurrentProcessId() &&
+        taskbar == FindWindowW(L"Shell_TrayWnd", nullptr) &&
+        windowThread == GetCurrentThreadId() &&
+        windowThread == g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
+        g_primaryTaskbar.load(std::memory_order_acquire) == taskbar && trayUi &&
+        IsTrayUiPointerFor(wndProcThis, trayUi);
+    if (!validTarget) {
+        Trace(L"panel bridge: reject close request hwnd=%p epoch=%llu targetValid=0",
+              taskbar, static_cast<unsigned long long>(epoch));
+        return 0;
+    }
+
+    if (!IsCurrentUnheldPanelEpoch(taskbar, epoch)) {
+        Trace(L"panel bridge: reject close request epoch=%llu current=%llu held=%d",
+              static_cast<unsigned long long>(epoch),
+              static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(
+                  GetPropW(taskbar, kPanelEpochProperty))),
+              HasPanelHold(taskbar));
+        return 0;
+    }
+
+    if (epoch == g_lastCompletedPanelEpoch) {
+        Trace(L"panel bridge: duplicate close request ignored epoch=%llu",
+              static_cast<unsigned long long>(epoch));
+        return 0;
+    }
+
+    if (IsTaskbarHiddenOnScreen(taskbar)) {
+        g_lastCompletedPanelEpoch = epoch;
+        Trace(L"panel bridge: taskbar already hidden at close epoch=%llu",
+              static_cast<unsigned long long>(epoch));
+        return 0;
+    }
+
+    if (g_pendingPanelResume.timerId) {
+        if (g_pendingPanelResume.epoch == epoch) {
+            Trace(L"panel bridge: duplicate queued request ignored epoch=%llu",
+                  static_cast<unsigned long long>(epoch));
+            return 0;
+        }
+        CancelPendingPanelResume(L"newer close request");
+    }
+
+    if (!g_lastPrimaryHideThis || g_lastPrimaryHideTrayUi != trayUi ||
+        g_lastPrimaryHideEpoch != epoch) {
+        Trace(L"panel bridge: no observed native _Hide context for epoch=%llu",
+              static_cast<unsigned long long>(epoch));
+        return 0;
+    }
+
+    const UINT delayMs = g_settings.hideDelayMs > 0
+                             ? static_cast<UINT>(g_settings.hideDelayMs)
+                             : kDefaultNativeHideDelayMs;
+    void* hideThis = g_lastPrimaryHideThis;
+    const UINT_PTR timerId = SetTimer(nullptr, 0, delayMs, PanelResumeTimerProc);
+    if (!timerId) {
+        Trace(L"panel bridge: unable to schedule native resume epoch=%llu error=%lu",
+              static_cast<unsigned long long>(epoch), GetLastError());
+        return 0;
+    }
+
+    g_pendingPanelResume = {taskbar, timerId, epoch,
+                            g_primaryTrayUiRevision, trayUi, hideThis};
+    // Consume the exact _Hide call that was suppressed for this epoch. A
+    // later close notification must not reuse it for another panel session.
+    g_lastPrimaryHideThis = nullptr;
+    g_lastPrimaryHideTrayUi = nullptr;
+    g_lastPrimaryHideEpoch = 0;
+    Trace(L"panel bridge: queued native resume epoch=%llu delay=%u this=%p",
+          static_cast<unsigned long long>(epoch), delayMs, hideThis);
+    return 0;
 }
 
 LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
@@ -1503,9 +1990,76 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
                                    WPARAM wParam,
                                    LPARAM lParam,
                                    bool* handled) {
-    RecordTrayUi(pThis, L"WndProc");
+    RecordTrayUi(pThis, L"WndProc", hWnd);
+
+    const UINT closeMessage =
+        g_panelSessionClosedMessage.load(std::memory_order_acquire);
+    if (closeMessage && message == closeMessage) {
+        if (handled) {
+            *handled = true;
+        }
+        return HandlePanelSessionClosed(pThis, hWnd, wParam, lParam);
+    }
+
+    if (message == WM_TIMER && g_pendingPanelResume.timerId &&
+        hWnd == g_pendingPanelResume.taskbar &&
+        wParam == g_pendingPanelResume.timerId) {
+        if (handled) {
+            *handled = true;
+        }
+        return CompletePanelResume(pThis, hWnd, wParam);
+    }
+
+    if (message == WM_NCDESTROY && IsPrimaryTaskbarWindow(hWnd)) {
+        ResetPrimaryTrayUi(hWnd, L"primary taskbar destroyed");
+    }
+
     return TrayUI_WndProc_Original(pThis, hWnd, message, wParam, lParam,
                                    handled);
+}
+
+// Gate only the primary TrayUI's native hide while the shared panel hold is
+// active. Secondary TrayUI instances never consult the primary taskbar prop.
+void WINAPI TrayUI__Hide_Hook(void* pThis) {
+    HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    DWORD pid = 0;
+    DWORD threadId = primaryTaskbar
+                         ? GetWindowThreadProcessId(primaryTaskbar, &pid)
+                         : 0;
+    void* knownTrayUi = g_trayUi.load(std::memory_order_acquire);
+    const bool isPrimaryTrayUi =
+        !g_unloading.load(std::memory_order_acquire) && knownTrayUi &&
+        primaryTaskbar && pid == GetCurrentProcessId() &&
+        threadId == GetCurrentThreadId() &&
+        threadId == g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
+        primaryTaskbar == g_primaryTaskbar.load(std::memory_order_acquire) &&
+        IsTrayUiPointerFor(pThis, knownTrayUi);
+
+    if (isPrimaryTrayUi) {
+        if (HasPanelHold(primaryTaskbar)) {
+            const UINT_PTR epoch = reinterpret_cast<UINT_PTR>(
+                GetPropW(primaryTaskbar, kPanelEpochProperty));
+            if (epoch) {
+                g_lastPrimaryHideThis = pThis;
+                g_lastPrimaryHideTrayUi = knownTrayUi;
+                g_lastPrimaryHideEpoch = epoch;
+            } else {
+                g_lastPrimaryHideThis = nullptr;
+                g_lastPrimaryHideTrayUi = nullptr;
+                g_lastPrimaryHideEpoch = 0;
+            }
+            Trace(L"_Hide held for primary TrayUI this=%p taskbar=%p", pThis,
+                  primaryTaskbar);
+            return;
+        }
+
+        // This native hide is proceeding normally, so it supersedes any
+        // previously suppressed request.
+        g_lastPrimaryHideThis = nullptr;
+        g_lastPrimaryHideTrayUi = nullptr;
+        g_lastPrimaryHideEpoch = 0;
+    }
+    TrayUI__Hide_Original(pThis);
 }
 
 bool IsDesktopWindow(HWND hWnd) {
@@ -1562,7 +2116,7 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     g_shownTicks = 0;
     SetEdgePollInterval(kEdgePollMs);
 
-    if (!g_trayUi) {
+    if (!g_primaryWndProcThis) {
         g_edgeRequested = false;
         return;
     }
@@ -1577,9 +2131,12 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     }
     RECT const& monitorRect = monitorInfo.rcMonitor;
 
-    // Bottom taskbars only; the hidden window hangs below the monitor.
+    // Bottom taskbars only; the hidden window hangs below the monitor. Keep
+    // the cursor on the monitor's final row so another monitor below cannot
+    // trigger this taskbar's reveal.
     const bool onEdge = taskbarRect.bottom > monitorRect.bottom &&
                         pt.y >= monitorRect.bottom - 1 &&
+                        pt.y < monitorRect.bottom &&
                         pt.x >= monitorRect.left && pt.x < monitorRect.right;
     if (!onEdge) {
         g_edgeRequested = false;
@@ -1601,7 +2158,8 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     }
 
     Trace(L"edge (%ld,%ld) outside the taskbar region: unhide", pt.x, pt.y);
-    TrayUI_Unhide_Original(g_trayUi, kUnhideFlagsNone, kUnhideRequestMouse);
+    TrayUI_Unhide_Original(g_trayUi.load(std::memory_order_acquire),
+                           kUnhideFlagsNone, kUnhideRequestMouse);
 }
 
 // Must run on the taskbar UI thread; the timer fires there.
@@ -1617,7 +2175,7 @@ void StartEdgePoll(HWND taskbar) {
     }
 
     g_edgeTaskbar = taskbar;
-    if (!g_trayUi) {
+    if (!g_primaryWndProcThis) {
         // After a reload nothing has reached TrayUI::WndProc yet; a no-op
         // message gets it the TrayUI pointer right away.
         SendMessageW(taskbar, WM_NULL, 0, 0);
@@ -1650,7 +2208,9 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
         WCHAR className[32]{};
         GetClassNameW(hWnd, className, ARRAYSIZE(className));
         if (_wcsicmp(className, L"Shell_TrayWnd") == 0) {
-            RecordTrayUi(pThis, L"SlideWindow");
+            RecordTrayUi(pThis, L"SlideWindow", hWnd);
+            if (show && g_pendingPanelResume.taskbar == hWnd)
+                CancelPendingPanelResume(L"new native reveal");
             StartEdgePoll(hWnd);
             // Fast from the start of a hide, idle once shown.
             g_shownTicks = 0;
@@ -1678,8 +2238,17 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
 
     // Re-entered while a hide pumps messages to commit its animation.
     if (g_syncHide.active) {
+        if (hWnd != g_syncHide.hWnd) {
+            Trace(L"-> native: another taskbar hide is committing");
+            TrayUI_SlideWindow_Original(pThis, hWnd, rect, monitor, show,
+                                        animate);
+            return;
+        }
         if (show) {
             g_syncHide.revealRequested = true;
+            g_syncHide.trayUi = pThis;
+            g_syncHide.revealRect = *rect;
+            g_syncHide.revealMonitor = monitor;
         }
         Trace(L"-> deferred until the running hide is committed");
         return;
@@ -1838,6 +2407,15 @@ std::vector<HWND> EnumerateTaskbars() {
 void WINAPI ApplyInitialStateOnUiThread(PVOID parameter) {
     HWND hWnd = reinterpret_cast<HWND>(parameter);
 
+    if (IsPrimaryTaskbarWindow(hWnd)) {
+        // Drop any readiness marker left by an interrupted prior load. The
+        // WndProc hook republishes it only after discovering this TrayUI.
+        RemovePropW(hWnd, kPanelBridgeReadyProperty);
+        if (!g_primaryWndProcThis) {
+            SendMessageW(hWnd, WM_NULL, 0, 0);
+        }
+    }
+
     MotionTarget target = GetTaskbarMotionTarget(hWnd);
     const bool hidden = IsTaskbarHiddenOnScreen(hWnd);
     Trace(L"load: taskbar %p hidden=%d target=%d (%s)", hWnd, hidden,
@@ -1858,6 +2436,11 @@ void WINAPI ApplyInitialStateOnUiThread(PVOID parameter) {
 
 void WINAPI CleanupTaskbarOnUiThread(PVOID parameter) {
     HWND hWnd = reinterpret_cast<HWND>(parameter);
+
+    if (IsPrimaryTaskbarWindow(hWnd)) {
+        ResetPrimaryTrayUi(hWnd, L"mod unload");
+        RemovePropW(hWnd, kPanelBridgeReadyProperty);
+    }
 
     if (hWnd == g_edgeTaskbar) {
         StopEdgePoll();
@@ -1991,6 +2574,11 @@ bool HookTaskbarSymbols() {
             TrayUI_SlideWindow_Hook,
         },
         {
+            {LR"(public: void __cdecl TrayUI::_Hide(void))"},
+            &TrayUI__Hide_Original,
+            TrayUI__Hide_Hook,
+        },
+        {
             {LR"(public: virtual void __cdecl TrayUI::Unhide(enum TrayCommon::TrayUnhideFlags,enum TrayCommon::UnhideRequest))"},
             &TrayUI_Unhide_Original,
             nullptr,
@@ -2018,8 +2606,27 @@ bool HookTaskbarSymbols() {
 BOOL Wh_ModInit() {
     LoadSettings();
     g_unloading.store(false, std::memory_order_release);
+    g_pendingPanelResume = {};
+    g_primaryWndProcThis = nullptr;
+    g_failedTrayUiLookupThis = nullptr;
+    g_lastPrimaryHideThis = nullptr;
+    g_lastPrimaryHideTrayUi = nullptr;
+    g_lastPrimaryHideEpoch = 0;
+    g_primaryTrayUiRevision = 0;
+    g_lastCompletedPanelEpoch = 0;
+    g_trayUi.store(nullptr, std::memory_order_release);
+    g_primaryTaskbar.store(nullptr, std::memory_order_release);
+    g_primaryTrayUiThreadId.store(0, std::memory_order_release);
+    const UINT sessionClosedMessage =
+        RegisterWindowMessageW(kPanelSessionClosedMessageName);
+    g_panelSessionClosedMessage.store(sessionClosedMessage,
+                                      std::memory_order_release);
 
     Trace(L"v" WH_MOD_VERSION L" init");
+    if (!sessionClosedMessage) {
+        Trace(L"panel bridge: could not register session-close message (%lu)",
+              GetLastError());
+    }
 
     if (!HookTaskbarSymbols()) {
         Trace(L"symbol hooks failed");

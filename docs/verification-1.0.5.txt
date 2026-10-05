@@ -1,0 +1,52 @@
+1.0.5 validation / 검증 결과
+2026-10-06
+
+Environment: Windows 11 25H2 build 26200, 175% scaling, Windhawk 1.7.3.
+Scope: primary monitor, bottom taskbar, entry through the dock panel buttons.
+Both self-contained .wh.cpp mods compiled and were installed together at 1.0.5.
+
+Behavior:
+Start, Search, Quick Settings, Notifications/calendar and hidden icons replace
+one another with a single dock-button click. The dock remains visible during
+transitions and child-page use, then resumes native hiding after the last
+panel closes. Cursor movement does not dismiss a panel. Quick Settings child
+Escape returns to the main page. The existing groupedDock setting selects
+native Center alignment when enabled and Left when disabled.
+
+Validation:
+- Stable candidate Q: 20 directional transitions x 3 and 5 same-button toggles
+  x 3, all 75 passed. See panel-consistency-transition-results.csv.
+- Wi-Fi, Bluetooth and audio output child entry, Escape and native Back;
+  tray menu Escape retaining its parent; jump list, Win+X and Task View.
+- Cursor outside for 10 seconds: panel and dock remained. Outside click hid
+  the dock. Three rapid-transition runs and three cancellation runs each for
+  outside click and Escape passed.
+- Final candidate: both alignment modes and independent registry reads;
+  Helper and Motion unload/reload with Quick Settings open; Escape hiding;
+  ShellHost restart, Wi-Fi entry/Escape back and main Escape close;
+  Explorer restart followed by all five panels and outside-click hiding;
+  Quick Settings/Escape with tracing disabled.
+  See panel-consistency-lifecycle-results.csv (28 observed states).
+- Final idle: panels closed, hold=0, taskbar top=1438; shown top=1368 at
+  2560x1440. Both mods enabled, groupedDock=1, tracing disabled.
+- Installed sources and DLLs matched the built work files by SHA-256.
+
+The 75-case matrix records candidate Q, not a second complete matrix on the
+final candidate. The final candidate's changes to initialization and alignment
+were checked with focused layout, reload and restart tests above. Start's
+SearchHost proxy is excluded from the logical primary-panel count; the raw
+lifecycle CSV retains both host visibility counters.
+
+The original alignment check read a different registry view from an
+independently launched same-user process. Validation therefore used a WMI
+launched reader plus screenshots. The final product uses ordinary registry
+setting and shell refresh; no reg.exe process or delayed persistence workaround
+is included.
+
+Limitations:
+- Win+A/Win+N and other entry outside the dock use native fallback; single-panel
+  enforcement is not guaranteed for those paths.
+- Other Windows builds and full multi-monitor behavior are unverified.
+- Widgets, language selection and app previews are outside this validation scope.
+- Recordings and screenshots are kept locally because they include personal
+  desktop content; only code and text validation records are published.
