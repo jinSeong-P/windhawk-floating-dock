@@ -36,9 +36,11 @@ Behavior and failure paths
   Close checks included outside focus/click after Escape; this does not prove
   that every shortcut closes and hides using Escape alone. An earlier strict
   hidden-dock test was not used to claim universal keyboard-entry support.
+  Task View resumes only an eligible native Hide that was previously
+  suppressed, and only when releasing an active hold.
 - E5: with the native _Hide lookup disabled in a test build, Motion loaded,
-  bridge ready and hold stayed zero, and reveal was observed. This did not
-  separately isolate whole-edge reveal from native reveal fallback.
+  bridge ready=0 and hold=0, and reveal was observed. This did not separately
+  isolate whole-edge reveal from native reveal fallback.
 - E6: forced input-hook installation failure left the click unintercepted and
   Windows executed it. Native fallback can leave multiple native panels open;
   the single-panel policy is not guaranteed on that failure path.
@@ -54,6 +56,8 @@ legacy Quick Settings events remain, including cloak/uncloak for hold release.
 Therefore bridge-disabled mode does not have zero event hooks.
 Global event delivery still has a cost. Per-process WinEvent hooks are deferred.
 Existing 250 ms layout and 40 ms hidden-edge checks remain.
+The edge geometry cache reduces GetMonitorInfoW calls only; MonitorFromWindow
+still runs.
 
 Short efficiency observation
 S2: dock shown, cursor stationary over the dock, no panels or user input.
@@ -84,7 +88,8 @@ Median: 1.0.5 77.92 ms; cached-geometry 1.0.6 77.97 ms; difference +0.05 ms.
 This meets the planned maximum +20 ms median increase, so candidate B was kept.
 The measure detects reveal start from taskbar window geometry, not animation
 completion. The 40 ms poll is unchanged. Display/taskbar changes invalidate
-the stationary-cursor monitor geometry cache.
+the stationary-cursor monitor geometry cache. These timings measure reveal
+responsiveness, not API-call reduction or resulting CPU/power savings.
 
 Evidence and limits
 Public matrix: panel-efficiency-1.0.6-transition-results.csv.

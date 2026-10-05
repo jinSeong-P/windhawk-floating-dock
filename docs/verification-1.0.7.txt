@@ -1,0 +1,66 @@
+Floating Dock 1.0.7 focused verification
+Date: 2026-10-06
+Baseline: 1.0.6, d2c9209
+Environment: Windows build 26200; primary bottom taskbar, 2560 x 1440.
+
+Reason for the change
+1.0.6 recognized visible Explorer Xaml_WindowedPopupClass windows from their
+owner chain. The class/owner combination alone does not prove menu content.
+Native taskbar tooltips using that combination were not established on this PC;
+this change is a defensive restriction, not a claim of a reproduced tooltip bug.
+
+Implementation
+- Require a MenuFlyoutPresenter in an open popup belonging to the taskbar's
+  XamlRoot. Inspect at most 32 visual nodes per open popup; catch unavailable
+  XAML access and leave unknown popups to Windows. Reuse the result within each
+  panel discovery. Explorer PID and taskbar/active-panel ownership checks remain.
+- XAML events set a separate dirty flag. The existing 20 ms one-shot checks
+  menu content before starting full window discovery from idle. Closing a popup
+  during an active session still schedules reconciliation and releases its hold.
+- Keep classic menu recognition and the existing shell-host jump-list route.
+  Do not require MENUPOPUPSTART or Win32 GUI menu-mode flags: this build's
+  Win+X XAML menu had GUI flags=0 and menuOwner=0 while open.
+- Remove the unused stored process creation time and GetProcessTimes call.
+  Retained handles and exit checks still identify the cached process lifetime.
+- Change request-generation diagnostic labels from epoch= to request=.
+  The hold epoch properties/messages and Motion resume logic are unchanged.
+- Both source versions are 1.0.7. Motion has only a version metadata change.
+
+Build and focused functional checks
+Both mods compiled with the installed Windhawk clang toolchain.
+The final normal build passed 10 state checks:
+1. Keyboard Win+X: XAML menu visible with nonzero panel hold.
+2. Win+X Escape: hold released.
+3. Start right-click: XAML menu visible with nonzero hold.
+4. Start context-menu Escape: hold released.
+5. App right-click: jump-list CoreWindow visible with nonzero hold.
+6. Jump-list Escape: hold released.
+7. Start click: CoreWindow visible with nonzero hold.
+8. Start to Quick Settings: target visible with continuous hold.
+9. Quick Settings to hidden icons: target visible with continuous hold.
+10. Hidden-icons Escape: hold released.
+A later snapshot confirmed the dock at its hidden position with no visible
+managed panel. Close checks at the immediate snapshot assert hold release,
+not completion of the native hide animation.
+
+Negative coverage and limits
+Natural app/Start hover did not produce a visible tooltip in the captured
+screen states. Do not treat those hover attempts as a native-tooltip pass.
+An initial manual ToolTip fixture failed to open and was excluded.
+A temporary build opened a programmatic XAML Popup with TextBlock content.
+After four seconds its probe reported menu=0, held=0, searches=0, timers=0.
+This supports rejecting non-menu content in the XAML tree. No visible native
+Xaml_WindowedPopupClass HWND was captured for that fixture, so it does not prove
+the entire native tooltip SHOW/HIDE path or tooltip-related hide latency.
+Temporary fixture code is absent from the release sources and normal DLLs
+were restored after the test. Screenshots are local only.
+
+The 1.0.6 75-case matrix, failure injection and short CPU observation remain
+historical 1.0.6 evidence; they were not rerun or relabeled as 1.0.7 results.
+No new CPU, S1, WPR, watt/battery or edge-latency measurements were taken.
+Other Windows builds and multiple monitors remain unverified.
+
+Installed state
+Normal source/DLL hashes match the final build, registry/UI versions are 1.0.7,
+both mods are enabled, macOS layout centered, and diagnostics are off.
+The previous normal 1.0.6 build is retained as a rollback backup.

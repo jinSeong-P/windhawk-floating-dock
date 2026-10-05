@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.7 (2026-10-06)
+
+- Require an open taskbar XAML menu presenter before recognizing an owned
+  XAML popup as a menu. Preserve Win+X keyboard entry and right-click menus.
+- Coalesce XAML popup events before checking their content. An idle popup
+  without menu content does not start full panel discovery or a panel hold.
+- Remove the unused process creation timestamp and its query; retained
+  process handles still protect the cache against PID reuse.
+- Label panel request generations as `request=` in diagnostic logs, keeping
+  the shared hold-session epoch distinct. Remove leftover blank lines.
+- Clarify the E5 bridge result, conditional Task View resume and the limits
+  of the geometry cache measurements in the 1.0.6 report. Record focused
+  1.0.7 verification and the remaining native tooltip coverage gap.
+- Motion's behavior is unchanged from 1.0.6; its version follows the pair.
+
 ## 1.0.6 (2026-10-06)
 
 - Stop periodic panel discovery while idle. Coalesce shell window events and

@@ -2,7 +2,7 @@
 // @id              floating-dock-helpers
 // @name            Floating Dock Helpers
 // @description     macOS-style layout for a floating Windows 11 taskbar (tray next to the centered dock), hot corners for Start and Show desktop, Quick Settings that follows the tray
-// @version         1.0.6
+// @version         1.0.7
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -94,10 +94,12 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #undef GetCurrentTime
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.Xaml.Automation.h>
 #include <winrt/Windows.UI.Xaml.Automation.Peers.h>
 #include <winrt/Windows.UI.Xaml.Automation.Provider.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Input.h>
@@ -1388,16 +1390,13 @@ HWINEVENTHOOK g_flyoutUncloakHook = nullptr;
 HWINEVENTHOOK g_flyoutMenuHook = nullptr;
 UINT_PTR g_panelEventTimer{};
 HWND g_quickSettingsDirty{};
-bool g_panelEventDirty{}, g_panelCoordinatorStarted{};
+bool g_panelEventDirty{}, g_xamlPopupDirty{}, g_panelCoordinatorStarted{};
 void SyncPanelTimer();
 void StartFlyoutPlacement();
 void StopFlyoutPlacement();
 HWND g_quickSettings = nullptr;
 UINT_PTR g_quickSettingsTimer = 0;
 int g_quickSettingsChecksLeft = 0;
-
-
-
 
 // Included inside the Explorer implementation namespace. All mutable state
 // and callbacks belong to the primary taskbar's XAML dispatcher thread.
@@ -1469,7 +1468,6 @@ bool PanelVisible(HWND window) {
 
 struct PanelProcessRecord {
     DWORD pid{};
-    ULONGLONG created{};
     HANDLE handle{};
     std::wstring name;
 };
@@ -1497,17 +1495,13 @@ std::wstring PanelProcessName(DWORD pid) {
     if (!process) return {};
     wchar_t path[MAX_PATH]{};
     DWORD length = ARRAYSIZE(path);
-    FILETIME created{}, exited{}, kernel{}, user{};
-    if (!QueryFullProcessImageNameW(process, 0, path, &length) ||
-        !GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    if (!QueryFullProcessImageNameW(process, 0, path, &length)) {
         CloseHandle(process);
         return {};
     }
     const wchar_t* filename = wcsrchr(path, L'\\');
     std::wstring name = filename ? filename + 1 : path;
-    const ULONGLONG creation = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) |
-                               created.dwLowDateTime;
-    g_panelProcesses.push_back({pid, creation, process, name});
+    g_panelProcesses.push_back({pid, process, name});
     return name;
 }
 
@@ -1520,11 +1514,41 @@ bool PanelPopupOwnedBy(HWND window, HWND owner) {
     return false;
 }
 
+bool TaskbarHasMenuFlyout() {
+    // Tooltips and menus can share the native popup class. Require an open
+    // MenuFlyoutPresenter in the taskbar's XAML tree, not just HWND ownership.
+    // This also covers keyboard Win+X, which has no Win32 menu-mode flag.
+    try {
+        auto root = g_parts.root.get();
+        if (!root) return false;
+        auto xamlRoot = root.XamlRoot();
+        if (!xamlRoot) return false;
+        for (auto const& popup : VisualTreeHelper::GetOpenPopupsForXamlRoot(xamlRoot)) {
+            if (!popup.IsOpen()) continue;
+            std::vector<DependencyObject> pending;
+            if (auto child = popup.Child()) pending.push_back(child);
+            // A flyout presenter is near the popup root. Bound the traversal
+            // so unrelated popup content cannot turn this into a tree scan.
+            for (size_t index = 0; index < pending.size() && index < 32; ++index) {
+                auto const element = pending[index];
+                if (element.try_as<Controls::MenuFlyoutPresenter>()) return true;
+                const int count = VisualTreeHelper::GetChildrenCount(element);
+                for (int child = 0; child < count && pending.size() < 32; ++child)
+                    pending.push_back(VisualTreeHelper::GetChild(element, child));
+            }
+        }
+    } catch (winrt::hresult_error const&) {
+        // Unknown popup kinds retain Windows' native behavior.
+    }
+    return false;
+}
+
 void DiscoverPanelWindows() {
     // Validate HWND, PID and thread every reconciliation. A recycled handle
     // cannot inherit an old record. Unknown CoreWindows are never dismissed.
     if (g_settings.traceToFile) ++g_panelCounters.searches;
     g_panelRegistry.clear();
+    std::optional<bool> menuFlyoutOpen;
     for (HWND window = FindWindowExW(nullptr, nullptr, nullptr, nullptr); window;
          window = FindWindowExW(nullptr, window, nullptr, nullptr)) {
         wchar_t cls[96]{};
@@ -1532,8 +1556,8 @@ void DiscoverPanelWindows() {
         const bool core = !wcscmp(cls, L"Windows.UI.Core.CoreWindow");
         const bool quick = !wcscmp(cls, L"ControlCenterWindow");
         const bool overflow = !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland");
-        const bool menu = !wcscmp(cls, L"#32768") ||
-                          !wcscmp(cls, L"Xaml_WindowedPopupClass");
+        const bool xamlPopup = !wcscmp(cls, L"Xaml_WindowedPopupClass");
+        const bool menu = !wcscmp(cls, L"#32768") || xamlPopup;
         if (!core && !quick && !overflow && !menu) continue;
         if (!PanelVisible(window)) continue;
         DWORD pid{};
@@ -1570,8 +1594,11 @@ void DiscoverPanelWindows() {
             const bool attachedToActiveUi =
                 PanelPopupOwnedBy(window, g_panelSession.window) ||
                 PanelPopupOwnedBy(window, g_taskbar);
-            if (attachedToActiveUi)
-                kind = PanelKind::Menu;
+            if (attachedToActiveUi) {
+                if (xamlPopup && !menuFlyoutOpen)
+                    menuFlyoutOpen = TaskbarHasMenuFlyout();
+                if (!xamlPopup || *menuFlyoutOpen) kind = PanelKind::Menu;
+            }
         }
         if (kind != PanelKind::None) g_panelRegistry.push_back({window, pid, thread, kind});
     }
@@ -1635,14 +1662,14 @@ void ReconcilePanels() {
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
     } else if (g_panelSession.deadline && now >= g_panelSession.deadline) {
-        Trace(L"panel transition expired epoch=%llu requested=%d actual=%d",
+        Trace(L"panel transition expired request=%llu requested=%d actual=%d",
               static_cast<unsigned long long>(g_panelRequestId),
               static_cast<int>(g_panelSession.requested), static_cast<int>(actual));
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
     }
     if (actual != g_panelSession.current) {
-        Trace(L"panel state epoch=%llu %d -> %d window=%p transition=%d",
+        Trace(L"panel state request=%llu %d -> %d window=%p transition=%d",
               static_cast<unsigned long long>(g_panelRequestId),
               static_cast<int>(g_panelSession.current), static_cast<int>(actual),
               PanelWindow(actual), g_panelSession.deadline != 0);
@@ -1693,7 +1720,7 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
     g_panelSession.requested = target;
     g_panelSession.deadline = GetTickCount64() + 1000;
     SetPanelHold(true);
-    Trace(L"panel input epoch=%llu old=%d target=%d",
+    Trace(L"panel input request=%llu old=%d target=%d",
           static_cast<unsigned long long>(g_panelRequestId),
           static_cast<int>(old), static_cast<int>(target));
     if (button && g_trayClicksHooked &&
@@ -1732,12 +1759,12 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
 }
 
 void CancelPendingPanelActivation(const wchar_t* reason) {
-    const UINT_PTR epoch = g_pendingPanelActivation.requestId;
-    if (!epoch) return;
-    Trace(L"panel deferred activation canceled epoch=%llu reason=%s",
-          static_cast<unsigned long long>(epoch), reason);
+    const UINT_PTR requestId = g_pendingPanelActivation.requestId;
+    if (!requestId) return;
+    Trace(L"panel deferred activation canceled request=%llu reason=%s",
+          static_cast<unsigned long long>(requestId), reason);
     ClearPendingPanelActivation();
-    if (epoch == g_panelRequestId && g_panelSession.deadline) {
+    if (requestId == g_panelRequestId && g_panelSession.deadline) {
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
         SetPanelHold(g_panelSession.current != PanelKind::None);
@@ -1844,7 +1871,8 @@ bool DeferNativeTrayClick(bool right) {
         !g_panelKeyboardHook || !g_panelMouseHook ||
         !OnTaskbarUiThread(g_taskbar)) return false;
     g_pendingPanelActivation.released = true;
-    Trace(L"panel native activation intercepted epoch=%llu", static_cast<unsigned long long>(g_panelRequestId));
+    Trace(L"panel native activation intercepted request=%llu",
+          static_cast<unsigned long long>(g_panelRequestId));
     CompletePanelActivation();
     return true;
 }
@@ -2069,6 +2097,14 @@ void CALLBACK PanelEventTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
     KillTimer(nullptr, timer);
     g_panelEventTimer = 0;
     if (g_unloading.load()) return;
+    if (g_xamlPopupDirty) {
+        g_xamlPopupDirty = false;
+        // Hover-only popups must not start a full window discovery or hold.
+        // An existing session still needs reconciliation when its menu closes.
+        if (g_panelCoordinatorStarted &&
+            (g_panelSession.held || TaskbarHasMenuFlyout()))
+            g_panelEventDirty = true;
+    }
     const HWND quick = g_quickSettingsDirty;
     g_quickSettingsDirty = nullptr;
     if (quick) {
@@ -2104,13 +2140,22 @@ void CALLBACK FlyoutEventProc(HWINEVENTHOOK, DWORD event, HWND window,
     wchar_t cls[96]{};
     if (!GetClassNameW(window, cls, ARRAYSIZE(cls))) return;
     const bool quick = !wcscmp(cls, kQuickSettingsClass);
+    const bool xamlPopup = !wcscmp(cls, L"Xaml_WindowedPopupClass");
     const bool relevant = quick || !wcscmp(cls, L"Windows.UI.Core.CoreWindow") ||
         !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") ||
-        !wcscmp(cls, L"#32768") || !wcscmp(cls, L"Xaml_WindowedPopupClass") ||
+        !wcscmp(cls, L"#32768") || xamlPopup ||
         window == g_panelSession.window;
     if (!relevant || (!g_panelCoordinatorStarted && !quick)) return;
+    if (xamlPopup) {
+        DWORD pid{};
+        GetWindowThreadProcessId(window, &pid);
+        if (pid != GetCurrentProcessId() ||
+            (!PanelPopupOwnedBy(window, g_taskbar) &&
+             !PanelPopupOwnedBy(window, g_panelSession.window))) return;
+        g_xamlPopupDirty = true;
+    }
     if (quick) g_quickSettingsDirty = window;
-    if (g_panelCoordinatorStarted) g_panelEventDirty = true;
+    if (g_panelCoordinatorStarted && !xamlPopup) g_panelEventDirty = true;
     if (!g_panelEventTimer)
         g_panelEventTimer = SetTimer(nullptr, 0, 20, PanelEventTimerProc);
 }
@@ -2149,6 +2194,7 @@ void StopFlyoutPlacement() {
     if (g_panelEventTimer) KillTimer(nullptr, g_panelEventTimer);
     g_panelEventTimer = 0;
     g_panelEventDirty = false;
+    g_xamlPopupDirty = false;
     g_quickSettingsDirty = nullptr;
     StopQuickSettingsWatch();
 }

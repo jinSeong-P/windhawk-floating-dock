@@ -2,7 +2,7 @@
 // @id              taskbar-autohide-motion
 // @name            Taskbar Auto-Hide Motion
 // @description     Smooth slide and pop for the auto-hidden Windows 11 taskbar, invisible while hidden (OLED friendly), revealed along the whole bottom edge
-// @version         1.0.6
+// @version         1.0.7
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
