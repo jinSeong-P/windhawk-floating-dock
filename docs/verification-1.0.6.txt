@@ -78,7 +78,8 @@ Normal trace-disabled functional checks passed; no separate trace-disabled
 CPU benchmark was taken.
 
 Edge responsiveness (candidate B)
-20 throws to the lower edge per version; all 20 reveals succeeded in each.
+20 automated cursor jumps to the lower edge per version; all 20 reveals succeeded
+in each. This is a scripted reveal probe, not a physical mouse-motion test.
 Median: 1.0.5 77.92 ms; cached-geometry 1.0.6 77.97 ms; difference +0.05 ms.
 This meets the planned maximum +20 ms median increase, so candidate B was kept.
 The measure detects reveal start from taskbar window geometry, not animation
