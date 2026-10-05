@@ -1,0 +1,21 @@
+Code style
+
+Both Windhawk C++ mods use the repository's .clang-format configuration.
+Use clang-format 18.1.8 for reproducible formatting:
+
+  clang-format -i mods/floating-dock-helpers.wh.cpp mods/taskbar-autohide-motion.wh.cpp
+  clang-format --dry-run --Werror mods/floating-dock-helpers.wh.cpp mods/taskbar-autohide-motion.wh.cpp
+
+Use four spaces, attached braces, and braces for control-flow branches.
+Expand non-empty functions, branches, and try/catch blocks. Keep independent
+state declarations on separate lines; mutable globals use the g_ prefix.
+Use named constants for timing values and traversal limits, with units or
+purpose in the name. Scalar defaults use = 0, = false, or = nullptr;
+WinRT objects and aggregates retain their appropriate brace initialization.
+
+Keep includes in the existing groups and preserve Windows/WinRT dependency
+ordering. Keep Windhawk metadata, embedded README/settings, exact symbol
+strings, and user-visible text intact. Long symbol strings and embedded
+documentation may exceed the 80-column code target.
+
+Keep formatting separate from behavioral changes and state refactoring.

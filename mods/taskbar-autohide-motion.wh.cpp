@@ -119,11 +119,11 @@ Windhawk taskbar mods in the official ramensoftware/windhawk-mods repository.
 #include <windhawk_utils.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
-#include <array>
 #include <initializer_list>
 #include <iterator>
 #include <optional>
@@ -139,8 +139,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #undef GetCurrentTime
 
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Numerics.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
@@ -177,7 +177,10 @@ constexpr UINT kDefaultNativeHideDelayMs = 500;
 constexpr int kHideCleanupMs = 40;
 
 struct CubicBezier {
-    float x1, y1, x2, y2;
+    float x1;
+    float y1;
+    float x2;
+    float y2;
 };
 
 // Material 3 emphasized decelerate / accelerate.
@@ -251,9 +254,9 @@ void Trace(const wchar_t* format, ...) {
         return;
     }
 
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file =
+        CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         return;
     }
@@ -291,10 +294,8 @@ bool IsTaskbarWindow(HWND hWnd) {
 
 HWND GetTaskbarDispatchWindow(HWND taskbarWnd) {
     HWND uiWindow = FindWindowExW(
-        taskbarWnd,
-        nullptr,
-        L"Windows.UI.Composition.DesktopWindowContentBridge",
-        nullptr);
+        taskbarWnd, nullptr,
+        L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
     return uiWindow ? uiWindow : taskbarWnd;
 }
 
@@ -339,8 +340,8 @@ void* CSecondaryTaskBand_ITaskListWndSite_vftable = nullptr;
 using CTaskBand_GetTaskbarHost_t = void*(WINAPI*)(void* pThis, void** result);
 CTaskBand_GetTaskbarHost_t CTaskBand_GetTaskbarHost_Original = nullptr;
 
-using CSecondaryTaskBand_GetTaskbarHost_t =
-    void*(WINAPI*)(void* pThis, void** result);
+using CSecondaryTaskBand_GetTaskbarHost_t = void*(WINAPI*)(void* pThis,
+                                                           void** result);
 CSecondaryTaskBand_GetTaskbarHost_t CSecondaryTaskBand_GetTaskbarHost_Original =
     nullptr;
 
@@ -364,10 +365,10 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
 
 #if defined(_M_X64)
     {
-        const BYTE* b = static_cast<const BYTE*>(TaskbarHost_FrameHeight_Original);
-        if (b && b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC &&
-            b[3] == 0x28 && b[4] == 0x48 && b[5] == 0x83 &&
-            b[6] == 0xC1 && b[7] <= 0x7F) {
+        const BYTE* b =
+            static_cast<const BYTE*>(TaskbarHost_FrameHeight_Original);
+        if (b && b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[3] == 0x28 &&
+            b[4] == 0x48 && b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
             taskbarElementIUnknownOffset = b[7];
         }
     }
@@ -568,9 +569,9 @@ winrt::Windows::Foundation::TimeSpan Milliseconds(int ms) {
     return std::chrono::milliseconds(std::max(ms, 1));
 }
 
-composition::CompositionEasingFunction MakeEasing(
-    composition::Compositor const& compositor,
-    CubicBezier const& curve) {
+composition::CompositionEasingFunction
+MakeEasing(composition::Compositor const& compositor,
+           CubicBezier const& curve) {
     return compositor.CreateCubicBezierEasingFunction(
         numerics::float2{curve.x1, curve.y1},
         numerics::float2{curve.x2, curve.y2});
@@ -635,9 +636,9 @@ struct Motion {
                                             progress / waypoint->progress);
         }
         const numerics::float3 start = waypoint ? waypoint->value : from;
-        const float local =
-            waypoint ? (progress - waypoint->progress) / (1.0f - waypoint->progress)
-                     : progress;
+        const float local = waypoint ? (progress - waypoint->progress) /
+                                           (1.0f - waypoint->progress)
+                                     : progress;
         return start + (to - start) * CubicBezierAt(curve, local);
     }
 };
@@ -682,10 +683,9 @@ composition::CompositionAnimation AnimateTranslation(UIElement const& element,
         animation.Target(L"Translation");
         animation.InsertKeyFrame(0.0f, from);
         if (motion.waypoint) {
-            animation.InsertKeyFrame(motion.waypoint->progress,
-                                     motion.waypoint->value,
-                                     MakeEasing(compositor,
-                                                motion.waypoint->curve));
+            animation.InsertKeyFrame(
+                motion.waypoint->progress, motion.waypoint->value,
+                MakeEasing(compositor, motion.waypoint->curve));
         }
         animation.InsertKeyFrame(1.0f, motion.to,
                                  MakeEasing(compositor, motion.curve));
@@ -818,8 +818,8 @@ void StopScalePop(HWND hWnd) {
 FrameworkElement VisiblePart(FrameworkElement const& part) {
     using winrt::Windows::UI::Xaml::Media::VisualTreeHelper;
     if (VisualTreeHelper::GetChildrenCount(part) > 0) {
-        if (auto inner =
-                VisualTreeHelper::GetChild(part, 0).try_as<FrameworkElement>()) {
+        if (auto inner = VisualTreeHelper::GetChild(part, 0)
+                             .try_as<FrameworkElement>()) {
             return inner;
         }
     }
@@ -864,8 +864,8 @@ int StartScalePop(HWND hWnd, UIElement const& root) {
     double peakValue = 0.0;
     int durationMs = 0;
     for (int ms = 0; ms <= 2000; ms += 2) {
-        peakValue = std::max(peakValue, SpringImpulse(ms / 1000.0,
-                                                      springDuration, bounce));
+        peakValue = std::max(
+            peakValue, SpringImpulse(ms / 1000.0, springDuration, bounce));
     }
     for (int ms = 0; ms <= 2000; ms += 2) {
         if (std::abs(SpringImpulse(ms / 1000.0, springDuration, bounce)) >
@@ -882,19 +882,19 @@ int StartScalePop(HWND hWnd, UIElement const& root) {
     std::vector<float> scales;
     for (int k = 1; k < kScalePopKeyframes; k++) {
         const float progress = static_cast<float>(k) / kScalePopKeyframes;
-        scales.push_back(1.0f + amplitude * static_cast<float>(
-                                                SpringImpulse(
-                                                    progress * durationMs / 1000.0,
-                                                    springDuration, bounce) /
-                                                peakValue));
+        scales.push_back(
+            1.0f + amplitude * static_cast<float>(
+                                   SpringImpulse(progress * durationMs / 1000.0,
+                                                 springDuration, bounce) /
+                                   peakValue));
     }
 
     auto& started = g_scaleAnimations[hWnd];
     bool trayStarted = false;
     for (int i = 0; i < count; i++) {
         try {
-            auto top = VisualTreeHelper::GetChild(root, i)
-                           .try_as<FrameworkElement>();
+            auto top =
+                VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
             if (!top) {
                 continue;
             }
@@ -911,12 +911,12 @@ int StartScalePop(HWND hWnd, UIElement const& root) {
                 const Thickness border = PanelBorder(part);
                 const auto offset = part.ActualOffset();
                 auto transform = PartTransform(top);
-                transform.CenterX(offset.x + border.Left +
-                                  (part.ActualWidth() - border.Left -
-                                   border.Right) / 2);
-                transform.CenterY(offset.y + border.Top +
-                                  (part.ActualHeight() - border.Top -
-                                   border.Bottom) / 2);
+                transform.CenterX(
+                    offset.x + border.Left +
+                    (part.ActualWidth() - border.Left - border.Right) / 2);
+                transform.CenterY(
+                    offset.y + border.Top +
+                    (part.ActualHeight() - border.Top - border.Bottom) / 2);
 
                 animation::Storyboard storyboard;
                 for (const wchar_t* property : {L"ScaleX", L"ScaleY"}) {
@@ -959,8 +959,8 @@ int StartScalePop(HWND hWnd, UIElement const& root) {
             for (size_t k = 0; k < scales.size(); k++) {
                 const float progress =
                     static_cast<float>(k + 1) / kScalePopKeyframes;
-                animation.InsertKeyFrame(
-                    progress, {scales[k], scales[k], 1.0f}, linear);
+                animation.InsertKeyFrame(progress, {scales[k], scales[k], 1.0f},
+                                         linear);
             }
             animation.InsertKeyFrame(1.0f, {1.0f, 1.0f, 1.0f}, linear);
             animation.Duration(Milliseconds(durationMs));
@@ -1054,6 +1054,7 @@ struct SyncHideState {
     RECT revealRect{};
     HMONITOR revealMonitor = nullptr;
 };
+
 thread_local SyncHideState g_syncHide;
 
 struct SyncHideGuard {
@@ -1088,9 +1089,8 @@ enum class SyncHideWaitResult {
 // Keeps the taskbar UI thread responsive while the composition animation runs.
 // WM_QUIT is reposted before returning so the enclosing message loop still sees
 // it; the caller then commits the native hide handoff immediately.
-SyncHideWaitResult WaitForHideAnimation(ULONGLONG start,
-                                        int durationMs,
-                                        bool& rendered) {
+SyncHideWaitResult
+WaitForHideAnimation(ULONGLONG start, int durationMs, bool& rendered) {
     const ULONGLONG renderDeadline = start + 60;
     const ULONGLONG deadline = start + durationMs;
     MSG msg{};
@@ -1113,9 +1113,9 @@ SyncHideWaitResult WaitForHideAnimation(ULONGLONG start,
             waitMs = std::min(waitMs, renderDeadline - now);
         }
 
-        const DWORD waitResult = MsgWaitForMultipleObjectsEx(
-            0, nullptr, static_cast<DWORD>(waitMs), QS_ALLINPUT,
-            MWMO_INPUTAVAILABLE);
+        const DWORD waitResult =
+            MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(waitMs),
+                                        QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (waitResult == WAIT_FAILED) {
             Trace(L"hide message wait failed: %lu", GetLastError());
             return SyncHideWaitResult::WaitFailed;
@@ -1195,8 +1195,8 @@ void CALLBACK AnimationTimerProc(HWND, UINT, UINT_PTR idEvent, DWORD) {
     PendingAnimation pending{};
     bool found = false;
 
-    for (auto it = g_pendingAnimations.begin();
-         it != g_pendingAnimations.end(); ++it) {
+    for (auto it = g_pendingAnimations.begin(); it != g_pendingAnimations.end();
+         ++it) {
         if (it->second.timerId == idEvent) {
             pending = std::move(it->second);
             g_pendingAnimations.erase(it);
@@ -1212,44 +1212,41 @@ void CALLBACK AnimationTimerProc(HWND, UINT, UINT_PTR idEvent, DWORD) {
     auto element = pending.element.get();
 
     switch (pending.kind) {
-        case PendingKind::RevealSettle:
-            StopPendingAnimations(pending);
-            SetRestingState(pending.hWnd, element, true);
-            Trace(L"reveal done");
-            break;
+    case PendingKind::RevealSettle:
+        StopPendingAnimations(pending);
+        SetRestingState(pending.hWnd, element, true);
+        Trace(L"reveal done");
+        break;
 
-        case PendingKind::HideCommit: {
-            // The content has slid to the hidden position, where only the
-            // thin strip is on screen. Make it transparent and move the HWND
-            // to Windows' hidden rect.
-            SetContentOpacity(element, false);
+    case PendingKind::HideCommit: {
+        // The content has slid to the hidden position, where only the
+        // thin strip is on screen. Make it transparent and move the HWND
+        // to Windows' hidden rect.
+        SetContentOpacity(element, false);
 
-            TrayUI_SlideWindow_Original(pending.trayUi,
-                                        pending.hWnd,
-                                        &pending.endRect,
-                                        pending.monitor,
-                                        false,
-                                        false);
+        TrayUI_SlideWindow_Original(pending.trayUi, pending.hWnd,
+                                    &pending.endRect, pending.monitor, false,
+                                    false);
 
-            // Reset the translation a few frames later, so the HWND move and
-            // the reset can't be composed into the same frame.
-            PendingAnimation cleanup = pending;
-            cleanup.kind = PendingKind::HideCleanup;
-            cleanup.timerId = 0;
-            if (!SchedulePending(std::move(cleanup), kHideCleanupMs)) {
-                StopPendingAnimations(pending);
-                SetRestingState(pending.hWnd, element, false);
-            }
-
-            Trace(L"hide committed");
-            break;
-        }
-
-        case PendingKind::HideCleanup:
+        // Reset the translation a few frames later, so the HWND move and
+        // the reset can't be composed into the same frame.
+        PendingAnimation cleanup = pending;
+        cleanup.kind = PendingKind::HideCleanup;
+        cleanup.timerId = 0;
+        if (!SchedulePending(std::move(cleanup), kHideCleanupMs)) {
             StopPendingAnimations(pending);
             SetRestingState(pending.hWnd, element, false);
-            Trace(L"hide done");
-            break;
+        }
+
+        Trace(L"hide committed");
+        break;
+    }
+
+    case PendingKind::HideCleanup:
+        StopPendingAnimations(pending);
+        SetRestingState(pending.hWnd, element, false);
+        Trace(L"hide done");
+        break;
     }
 }
 
@@ -1300,8 +1297,8 @@ void Reveal(void* pThis,
 
     CancelPendingAnimation(hWnd, true);
 
-    Motion motion{from, {0.0f, 0.0f, 0.0f}, g_settings.revealDurationMs,
-                  kRevealCurve};
+    Motion motion{
+        from, {0.0f, 0.0f, 0.0f}, g_settings.revealDurationMs, kRevealCurve};
 
     const float travel = numerics::length(from);
     if (g_settings.profile == MotionProfile::Expressive &&
@@ -1340,14 +1337,8 @@ void Reveal(void* pThis,
     TrayUI_SlideWindow_Original(pThis, hWnd, rect, monitor, true, false);
 
     PendingAnimation pending{
-        PendingKind::RevealSettle,
-        0,
-        hWnd,
-        pThis,
-        *rect,
-        monitor,
-        winrt::make_weak(element),
-        translation,
+        PendingKind::RevealSettle, 0,           hWnd, pThis, *rect, monitor,
+        winrt::make_weak(element), translation,
     };
 
     if (!SchedulePending(std::move(pending), durationMs + 32)) {
@@ -1412,8 +1403,11 @@ void Hide(void* pThis,
         bool rendered = false;
         winrt::event_token token{};
         try {
-            token = winrt::Windows::UI::Xaml::Media::CompositionTarget::Rendering(
-                [&rendered](auto const&, auto const&) { rendered = true; });
+            token =
+                winrt::Windows::UI::Xaml::Media::CompositionTarget::Rendering(
+                    [&rendered](auto const&, auto const&) {
+                        rendered = true;
+                    });
         } catch (...) {
             rendered = true;
         }
@@ -1451,11 +1445,10 @@ void Hide(void* pThis,
             const RECT& revealRect = deferredReveal.revealRequested
                                          ? deferredReveal.revealRect
                                          : currentRect;
-            Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis,
-                   hWnd, &revealRect,
-                   deferredReveal.revealRequested
-                       ? deferredReveal.revealMonitor
-                       : monitor,
+            Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis, hWnd,
+                   &revealRect,
+                   deferredReveal.revealRequested ? deferredReveal.revealMonitor
+                                                  : monitor,
                    revealCurrentRect, target);
             return;
         }
@@ -1482,8 +1475,8 @@ void Hide(void* pThis,
         if (!GetWindowRect(hWnd, &revealCurrentRect)) {
             revealCurrentRect = *rect;
         }
-        Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis,
-               hWnd, &deferredReveal.revealRect,
+        Reveal(deferredReveal.trayUi ? deferredReveal.trayUi : pThis, hWnd,
+               &deferredReveal.revealRect,
                deferredReveal.revealMonitor ? deferredReveal.revealMonitor
                                             : monitor,
                revealCurrentRect, target);
@@ -1726,8 +1719,7 @@ void ResetPrimaryTrayUi(HWND taskbar, const wchar_t* reason) {
 
 void PublishPanelBridgeReady(HWND taskbar) {
     if (g_unloading.load(std::memory_order_acquire) ||
-        !g_trayUi.load(std::memory_order_acquire) ||
-        !g_primaryWndProcThis ||
+        !g_trayUi.load(std::memory_order_acquire) || !g_primaryWndProcThis ||
         g_primaryTaskbar.load(std::memory_order_acquire) != taskbar ||
         g_primaryTrayUiThreadId.load(std::memory_order_acquire) !=
             GetCurrentThreadId() ||
@@ -1754,7 +1746,8 @@ void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
     const DWORD cachedThreadId =
         g_primaryTrayUiThreadId.load(std::memory_order_acquire);
     if (fromWndProc && received == g_primaryWndProcThis && currentTrayUi &&
-        taskbar && taskbar == g_primaryTaskbar.load(std::memory_order_acquire) &&
+        taskbar &&
+        taskbar == g_primaryTaskbar.load(std::memory_order_acquire) &&
         cachedThreadId && cachedThreadId == currentThreadId) {
         // These values were validated when this primary TrayUI context was
         // recorded; stable WndProc messages can skip repeated window lookups.
@@ -1850,9 +1843,7 @@ bool IsCurrentUnheldPanelEpoch(HWND taskbar, UINT_PTR epoch) {
     return true;
 }
 
-LRESULT CompletePanelResume(void* wndProcThis,
-                            HWND taskbar,
-                            UINT_PTR timerId) {
+LRESULT CompletePanelResume(void* wndProcThis, HWND taskbar, UINT_PTR timerId) {
     PendingPanelResume pending = g_pendingPanelResume;
     if (!pending.timerId || pending.timerId != timerId ||
         pending.taskbar != taskbar) {
@@ -1867,19 +1858,21 @@ LRESULT CompletePanelResume(void* wndProcThis,
     DWORD windowThread = GetWindowThreadProcessId(taskbar, &pid);
     const bool currentContext =
         !g_unloading.load(std::memory_order_acquire) &&
-        pid == GetCurrentProcessId() && taskbar == FindWindowW(L"Shell_TrayWnd", nullptr) &&
+        pid == GetCurrentProcessId() &&
+        taskbar == FindWindowW(L"Shell_TrayWnd", nullptr) &&
         windowThread == GetCurrentThreadId() && TrayUI__Hide_Original &&
-        windowThread == g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
+        windowThread ==
+            g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
         pending.trayUiRevision == g_primaryTrayUiRevision &&
-        pending.trayUi == trayUi &&
-        pending.hideThis && IsTrayUiPointerFor(pending.hideThis, trayUi) &&
+        pending.trayUi == trayUi && pending.hideThis &&
+        IsTrayUiPointerFor(pending.hideThis, trayUi) &&
         IsTrayUiPointerFor(wndProcThis, trayUi);
-    const bool currentEpoch =
-        IsCurrentUnheldPanelEpoch(taskbar, pending.epoch);
+    const bool currentEpoch = IsCurrentUnheldPanelEpoch(taskbar, pending.epoch);
     if (!currentContext || !currentEpoch) {
-        Trace(L"panel bridge: resume expired epoch=%llu context=%d epochValid=%d",
-              static_cast<unsigned long long>(pending.epoch), currentContext,
-              currentEpoch);
+        Trace(
+            L"panel bridge: resume expired epoch=%llu context=%d epochValid=%d",
+            static_cast<unsigned long long>(pending.epoch), currentContext,
+            currentEpoch);
         return 0;
     }
 
@@ -1920,9 +1913,12 @@ LRESULT CompletePanelResume(void* wndProcThis,
 }
 
 void CALLBACK PanelResumeTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
-    if (g_pendingPanelResume.timerId == timer)
-        CompletePanelResume(g_primaryWndProcThis, g_pendingPanelResume.taskbar, timer);
+    if (g_pendingPanelResume.timerId == timer) {
+        CompletePanelResume(g_primaryWndProcThis, g_pendingPanelResume.taskbar,
+                            timer);
+    }
 }
+
 LRESULT HandlePanelSessionClosed(void* wndProcThis,
                                  HWND taskbar,
                                  WPARAM wParam,
@@ -1936,21 +1932,24 @@ LRESULT HandlePanelSessionClosed(void* wndProcThis,
         pid == GetCurrentProcessId() &&
         taskbar == FindWindowW(L"Shell_TrayWnd", nullptr) &&
         windowThread == GetCurrentThreadId() &&
-        windowThread == g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
+        windowThread ==
+            g_primaryTrayUiThreadId.load(std::memory_order_acquire) &&
         g_primaryTaskbar.load(std::memory_order_acquire) == taskbar && trayUi &&
         IsTrayUiPointerFor(wndProcThis, trayUi);
     if (!validTarget) {
-        Trace(L"panel bridge: reject close request hwnd=%p epoch=%llu targetValid=0",
-              taskbar, static_cast<unsigned long long>(epoch));
+        Trace(
+            L"panel bridge: reject close request hwnd=%p epoch=%llu targetValid=0",
+            taskbar, static_cast<unsigned long long>(epoch));
         return 0;
     }
 
     if (!IsCurrentUnheldPanelEpoch(taskbar, epoch)) {
-        Trace(L"panel bridge: reject close request epoch=%llu current=%llu held=%d",
-              static_cast<unsigned long long>(epoch),
-              static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(
-                  GetPropW(taskbar, kPanelEpochProperty))),
-              HasPanelHold(taskbar));
+        Trace(
+            L"panel bridge: reject close request epoch=%llu current=%llu held=%d",
+            static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(reinterpret_cast<UINT_PTR>(
+                GetPropW(taskbar, kPanelEpochProperty))),
+            HasPanelHold(taskbar));
         return 0;
     }
 
@@ -1987,15 +1986,17 @@ LRESULT HandlePanelSessionClosed(void* wndProcThis,
                              ? static_cast<UINT>(g_settings.hideDelayMs)
                              : kDefaultNativeHideDelayMs;
     void* hideThis = g_lastPrimaryHideThis;
-    const UINT_PTR timerId = SetTimer(nullptr, 0, delayMs, PanelResumeTimerProc);
+    const UINT_PTR timerId =
+        SetTimer(nullptr, 0, delayMs, PanelResumeTimerProc);
     if (!timerId) {
-        Trace(L"panel bridge: unable to schedule native resume epoch=%llu error=%lu",
-              static_cast<unsigned long long>(epoch), GetLastError());
+        Trace(
+            L"panel bridge: unable to schedule native resume epoch=%llu error=%lu",
+            static_cast<unsigned long long>(epoch), GetLastError());
         return 0;
     }
 
-    g_pendingPanelResume = {taskbar, timerId, epoch,
-                            g_primaryTrayUiRevision, trayUi, hideThis};
+    g_pendingPanelResume = {taskbar, timerId, epoch, g_primaryTrayUiRevision,
+                            trayUi,  hideThis};
     // Consume the exact _Hide call that was suppressed for this epoch. A
     // later close notification must not reuse it for another panel session.
     g_lastPrimaryHideThis = nullptr;
@@ -2016,7 +2017,9 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
 
     if (hWnd == g_edgeTaskbar &&
         (message == WM_DISPLAYCHANGE || message == WM_SETTINGCHANGE ||
-         message == WM_DPICHANGED)) g_edgeGeometryValid = false;
+         message == WM_DPICHANGED)) {
+        g_edgeGeometryValid = false;
+    }
 
     const UINT closeMessage =
         g_panelSessionClosedMessage.load(std::memory_order_acquire);
@@ -2040,9 +2043,8 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
 void WINAPI TrayUI__Hide_Hook(void* pThis) {
     HWND primaryTaskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
     DWORD pid = 0;
-    DWORD threadId = primaryTaskbar
-                         ? GetWindowThreadProcessId(primaryTaskbar, &pid)
-                         : 0;
+    DWORD threadId =
+        primaryTaskbar ? GetWindowThreadProcessId(primaryTaskbar, &pid) : 0;
     void* knownTrayUi = g_trayUi.load(std::memory_order_acquire);
     const bool isPrimaryTrayUi =
         !g_unloading.load(std::memory_order_acquire) && knownTrayUi &&
@@ -2163,12 +2165,15 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     if (!GetCursorPos(&pt) || !GetWindowRect(taskbar, &taskbarRect)) {
         return;
     }
-    const HMONITOR monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR monitor =
+        MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
     if (!g_edgeGeometryValid || pt.x != g_edgeGeometryCursor.x ||
         pt.y != g_edgeGeometryCursor.y || monitor != g_edgeGeometryMonitor ||
         !EqualRect(&taskbarRect, &g_edgeGeometryTaskbar)) {
         MONITORINFO info{sizeof(info)};
-        if (!GetMonitorInfoW(monitor, &info)) return;
+        if (!GetMonitorInfoW(monitor, &info)) {
+            return;
+        }
         g_edgeGeometry = info;
         g_edgeGeometryCursor = pt;
         g_edgeGeometryTaskbar = taskbarRect;
@@ -2182,8 +2187,8 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     // trigger this taskbar's reveal.
     const bool onEdge = taskbarRect.bottom > monitorRect.bottom &&
                         pt.y >= monitorRect.bottom - 1 &&
-                        pt.y < monitorRect.bottom &&
-                        pt.x >= monitorRect.left && pt.x < monitorRect.right;
+                        pt.y < monitorRect.bottom && pt.x >= monitorRect.left &&
+                        pt.x < monitorRect.right;
     if (!onEdge) {
         g_edgeRequested = false;
         return;
@@ -2231,8 +2236,7 @@ void StartEdgePoll(HWND taskbar) {
         g_edgeRequested = false;
         g_shownTicks = 0;
         g_edgePollInterval = kEdgePollMs;
-        g_edgePollTimer =
-            SetTimer(nullptr, 0, kEdgePollMs, EdgePollTimerProc);
+        g_edgePollTimer = SetTimer(nullptr, 0, kEdgePollMs, EdgePollTimerProc);
     }
 }
 
@@ -2257,8 +2261,9 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
         GetClassNameW(hWnd, className, ARRAYSIZE(className));
         if (_wcsicmp(className, L"Shell_TrayWnd") == 0) {
             RecordTrayUi(pThis, L"SlideWindow", hWnd);
-            if (show && g_pendingPanelResume.taskbar == hWnd)
+            if (show && g_pendingPanelResume.taskbar == hWnd) {
                 CancelPendingPanelResume(L"new native reveal");
+            }
             StartEdgePoll(hWnd);
             // Fast from the start of a hide, idle once shown.
             g_shownTicks = 0;
@@ -2362,8 +2367,7 @@ UINT_PTR WINAPI SetTimer_Hook(HWND hWnd,
                               TIMERPROC lpTimerFunc) {
     if (hWnd &&
         (nIDEvent == kTrayUITimerHide || nIDEvent == kTrayUITimerUnhide) &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        IsTaskbarWindow(hWnd)) {
+        !g_unloading.load(std::memory_order_acquire) && IsTaskbarWindow(hWnd)) {
         const int delay = nIDEvent == kTrayUITimerUnhide
                               ? g_settings.unhideDelayMs
                               : g_settings.hideDelayMs;
@@ -2417,8 +2421,7 @@ bool RunFromWindowThread(HWND hWnd,
             }
             return CallNextHookEx(nullptr, code, wParam, lParam);
         },
-        nullptr,
-        threadId);
+        nullptr, threadId);
 
     if (!hook) {
         return false;
@@ -2504,12 +2507,9 @@ void WINAPI CleanupTaskbarOnUiThread(PVOID parameter) {
 
         if (pending.kind == PendingKind::HideCommit &&
             TrayUI_SlideWindow_Original) {
-            TrayUI_SlideWindow_Original(pending.trayUi,
-                                        pending.hWnd,
-                                        &pending.endRect,
-                                        pending.monitor,
-                                        false,
-                                        false);
+            TrayUI_SlideWindow_Original(pending.trayUi, pending.hWnd,
+                                        &pending.endRect, pending.monitor,
+                                        false, false);
         }
 
         StopPendingAnimations(pending);
@@ -2649,7 +2649,6 @@ bool HookTaskbarSymbols() {
     return true;
 }
 
-
 }  // namespace
 
 BOOL Wh_ModInit() {
@@ -2684,8 +2683,7 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    WindhawkUtils::SetFunctionHook(SetTimer, SetTimer_Hook,
-                                   &SetTimer_Original);
+    WindhawkUtils::SetFunctionHook(SetTimer, SetTimer_Hook, &SetTimer_Original);
 
     return TRUE;
 }

@@ -73,6 +73,7 @@ taskbar mods in the official ramensoftware/windhawk-mods repository.
 */
 // ==/WindhawkModSettings==
 
+#include <windhawk_api.h>
 #include <windhawk_utils.h>
 
 #include <algorithm>
@@ -80,8 +81,10 @@ taskbar mods in the official ramensoftware/windhawk-mods repository.
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
-#include <optional>
+#include <cwchar>
+#include <initializer_list>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -93,25 +96,19 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 
 #undef GetCurrentTime
 
-#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.UI.Xaml.Automation.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.Automation.Peers.h>
 #include <winrt/Windows.UI.Xaml.Automation.Provider.h>
-#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Automation.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
-#include <winrt/Windows.UI.Xaml.Input.h>
-#include <winrt/Windows.UI.Input.h>
 #include <winrt/base.h>
-
-// ShellHost Quick Settings advanced-page Escape adapter.
-
-#include <cwchar>
-#include <initializer_list>
-#include <windhawk_api.h>
-#include <winrt/Windows.System.h>
 
 // Narrow ShellHost-side support for Escape on Quick Settings advanced pages.
 // Initialized only in ShellHost.exe; late-loaded ControlCenter hooks are
@@ -119,17 +116,17 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace QsPanelEscape {
 namespace detail {
 
-using OnPreviewKeyDown_t = void (*)(
-    void* page,
-    winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs const& args);
+using OnPreviewKeyDown_t =
+    void (*)(void* page,
+             winrt::Windows::UI::Xaml::Input::KeyRoutedEventArgs const& args);
 using NavigateToAdvancedPage_t = void (*)(void* view,
                                           void* typeName,
                                           void* advancedPageInfo);
 using ResetAdvancedPageFrame_t = void (*)(void* view);
 using ControlCenterViewDestructor_t = void (*)(void* view);
 using ControlCenterHide_t = void (*)(void* app, void* dismissArgs);
-inline ControlCenterHide_t g_hideOriginal{};
-inline void* g_hideTarget{};
+inline ControlCenterHide_t g_hideOriginal = nullptr;
+inline void* g_hideTarget = nullptr;
 
 inline OnPreviewKeyDown_t g_onPreviewKeyDownOriginal = nullptr;
 inline NavigateToAdvancedPage_t g_navigateToAdvancedPageOriginal = nullptr;
@@ -161,8 +158,8 @@ constexpr wchar_t kControlCenterViewDestructorSymbol[] =
 
 bool IsShellHostProcess() {
     wchar_t imagePath[MAX_PATH]{};
-    const DWORD length = GetModuleFileNameW(nullptr, imagePath,
-                                            ARRAYSIZE(imagePath));
+    const DWORD length =
+        GetModuleFileNameW(nullptr, imagePath, ARRAYSIZE(imagePath));
     if (!length || length >= ARRAYSIZE(imagePath)) {
         return false;
     }
@@ -198,9 +195,9 @@ void* FindExactDecoratedSymbol(HMODULE module, PCWSTR decoratedName) {
 
 void ClearAdvancedView(void* view) {
     void* expected = view;
-    if (g_advancedView.compare_exchange_strong(
-            expected, nullptr, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    if (g_advancedView.compare_exchange_strong(expected, nullptr,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
         g_advancedViewThreadId.store(0, std::memory_order_release);
     }
 }
@@ -309,17 +306,18 @@ void ControlCenterHideHook(void* app, void* dismissArgs) {
     // Public PDB and disassembly confirm the aggregate is indirect in RDX.
     g_hideOriginal(app, dismissArgs);
     const DWORD thread = g_advancedViewThreadId.load(std::memory_order_acquire);
-    if (thread == GetCurrentThreadId() && !IsForegroundQuickSettingsWindow(thread)) {
+    if (thread == GetCurrentThreadId() &&
+        !IsForegroundQuickSettingsWindow(thread)) {
         g_advancedView.store(nullptr, std::memory_order_release);
         g_advancedViewThreadId.store(0, std::memory_order_release);
     }
 }
 
 void RemoveQueuedHooks() {
-    for (void* target : {g_onPreviewKeyDownTarget,
-                         g_navigateToAdvancedPageTarget,
-                         g_resetAdvancedPageFrameTarget,
-                         g_controlCenterViewDestructorTarget, g_hideTarget}) {
+    for (void* target :
+         {g_onPreviewKeyDownTarget, g_navigateToAdvancedPageTarget,
+          g_resetAdvancedPageFrameTarget, g_controlCenterViewDestructorTarget,
+          g_hideTarget}) {
         if (target) {
             Wh_RemoveFunctionHook(target);
         }
@@ -353,7 +351,8 @@ inline BOOL InitializeQuickSettingsHost() {
         FindExactDecoratedSymbol(module, kResetAdvancedPageFrameSymbol);
     void* controlCenterViewDestructor =
         FindExactDecoratedSymbol(module, kControlCenterViewDestructorSymbol);
-    void* hide = FindExactDecoratedSymbol(module,
+    void* hide = FindExactDecoratedSymbol(
+        module,
         L"?Hide@ControlCenterApplication@ControlCenter@winrt@@QEAAXUControlCenterDismissArgs@23@@Z");
 
     if (!onPreviewKeyDown || !navigateToAdvancedPage ||
@@ -369,8 +368,7 @@ inline BOOL InitializeQuickSettingsHost() {
     g_hideTarget = hide;
 
     if (!Wh_SetFunctionHook(
-            onPreviewKeyDown,
-            reinterpret_cast<void*>(OnPreviewKeyDownHook),
+            onPreviewKeyDown, reinterpret_cast<void*>(OnPreviewKeyDownHook),
             reinterpret_cast<void**>(&g_onPreviewKeyDownOriginal)) ||
         !Wh_SetFunctionHook(
             navigateToAdvancedPage,
@@ -384,8 +382,9 @@ inline BOOL InitializeQuickSettingsHost() {
             controlCenterViewDestructor,
             reinterpret_cast<void*>(ControlCenterViewDestructorHook),
             reinterpret_cast<void**>(&g_controlCenterViewDestructorOriginal)) ||
-        !Wh_SetFunctionHook(hide, reinterpret_cast<void*>(ControlCenterHideHook),
-            reinterpret_cast<void**>(&g_hideOriginal))) {
+        !Wh_SetFunctionHook(hide,
+                            reinterpret_cast<void*>(ControlCenterHideHook),
+                            reinterpret_cast<void**>(&g_hideOriginal))) {
         RemoveQueuedHooks();
         g_onPreviewKeyDownTarget = nullptr;
         g_navigateToAdvancedPageTarget = nullptr;
@@ -450,6 +449,17 @@ using winrt::Windows::UI::Xaml::Media::VisualTreeHelper;
 
 namespace {
 
+// Keep timing values in milliseconds and traversal limits in nodes.
+constexpr DWORD kAlignmentBroadcastTimeoutMs = 1000;
+constexpr ULONGLONG kPartsLookupRetryMs = 1000;
+constexpr ULONGLONG kPanelTransitionTimeoutMs = 1000;
+constexpr UINT kPanelSafetyCheckMs = 100;
+constexpr UINT kPanelEventCoalesceMs = 20;
+constexpr UINT kPanelCancellationDeferMs = 1;
+constexpr ULONGLONG kPanelMetricsWindowMs = 60000;
+constexpr size_t kMaxPopupNodes = 32;
+constexpr int kMaxPanelButtonAncestorDepth = 24;
+
 struct Settings {
     bool groupedDock = true;
     int groupGapDip = 8;
@@ -493,9 +503,9 @@ void Trace(const wchar_t* format, ...) {
         return;
     }
 
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file =
+        CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         return;
     }
@@ -512,10 +522,8 @@ bool IsPrimaryTaskbar(HWND hWnd) {
 
 HWND GetTaskbarDispatchWindow(HWND taskbarWnd) {
     HWND uiWindow = FindWindowExW(
-        taskbarWnd,
-        nullptr,
-        L"Windows.UI.Composition.DesktopWindowContentBridge",
-        nullptr);
+        taskbarWnd, nullptr,
+        L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr);
     return uiWindow ? uiWindow : taskbarWnd;
 }
 
@@ -581,10 +589,10 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
 
 #if defined(_M_X64)
     {
-        const BYTE* b = static_cast<const BYTE*>(TaskbarHost_FrameHeight_Original);
-        if (b && b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC &&
-            b[3] == 0x28 && b[4] == 0x48 && b[5] == 0x83 &&
-            b[6] == 0xC1 && b[7] <= 0x7F) {
+        const BYTE* b =
+            static_cast<const BYTE*>(TaskbarHost_FrameHeight_Original);
+        if (b && b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[3] == 0x28 &&
+            b[4] == 0x48 && b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F) {
             taskbarElementIUnknownOffset = b[7];
         }
     }
@@ -694,8 +702,8 @@ Thickness PanelBorder(FrameworkElement const& element) {
 
 FrameworkElement VisiblePart(FrameworkElement const& part) {
     if (VisualTreeHelper::GetChildrenCount(part) > 0) {
-        if (auto inner =
-                VisualTreeHelper::GetChild(part, 0).try_as<FrameworkElement>()) {
+        if (auto inner = VisualTreeHelper::GetChild(part, 0)
+                             .try_as<FrameworkElement>()) {
             return inner;
         }
     }
@@ -704,9 +712,8 @@ FrameworkElement VisiblePart(FrameworkElement const& part) {
 
 // Depth-first search with a depth limit; the buttons sit a few levels down.
 template <typename Match>
-FrameworkElement FindDescendant(DependencyObject const& parent,
-                                Match const& match,
-                                int depth) {
+FrameworkElement
+FindDescendant(DependencyObject const& parent, Match const& match, int depth) {
     const int count = VisualTreeHelper::GetChildrenCount(parent);
     for (int i = 0; i < count; i++) {
         auto child = VisualTreeHelper::GetChild(parent, i);
@@ -739,6 +746,7 @@ struct DockParts {
     std::array<double, 5> lastInputs{};
     ULONGLONG nextLookup = 0;
 };
+
 DockParts g_parts;
 HWND g_taskbar = nullptr;
 bool g_alignmentApplied = false;
@@ -750,32 +758,31 @@ void ApplyNativeTaskbarAlignment(HWND taskbar) {
     constexpr wchar_t key[] =
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
     const DWORD desired = g_settings.groupedDock ? 1 : 0;
-    DWORD current = 0, bytes = sizeof(current);
+    DWORD current = 0;
+    DWORD bytes = sizeof(current);
     LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, key, L"TaskbarAl",
-        RRF_RT_REG_DWORD, nullptr, &current, &bytes);
+                                  RRF_RT_REG_DWORD, nullptr, &current, &bytes);
     if (status == ERROR_SUCCESS && current == desired) {
         g_alignmentApplied = true;
         return;
     }
-    status = RegSetKeyValueW(HKEY_CURRENT_USER, key, L"TaskbarAl",
-                             REG_DWORD, &desired, sizeof(desired));
+    status = RegSetKeyValueW(HKEY_CURRENT_USER, key, L"TaskbarAl", REG_DWORD,
+                             &desired, sizeof(desired));
     if (status != ERROR_SUCCESS) {
         Trace(L"native alignment write failed: %ld", status);
         return;
     }
     g_alignmentApplied = true;
     DWORD_PTR notificationResult = 0;
-    SendMessageTimeoutW(taskbar, WM_SETTINGCHANGE, 0,
-        reinterpret_cast<LPARAM>(L"TraySettings"), SMTO_ABORTIFHUNG, 1000,
-        &notificationResult);
+    SendMessageTimeoutW(
+        taskbar, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"),
+        SMTO_ABORTIFHUNG, kAlignmentBroadcastTimeoutMs, &notificationResult);
     // This reaches TrayUI::_HandleSettingChange, the same refresh entry used
     // by the official taskbar-icon-size mod. Merely broadcasting TraySettings
     // doesn't refresh all of Windows' cached taskbar layout state.
     PostMessageW(taskbar, WM_SETTINGCHANGE, SPI_SETLOGICALDPIOVERRIDE, 0);
     Trace(L"native alignment set to %s", desired ? L"center" : L"left");
 }
-
-
 
 void UpdateGroupedLayout(bool syncLayout);
 
@@ -789,7 +796,8 @@ bool FindParts(HWND taskbar) {
     FrameworkElement tray{nullptr};
     const int count = VisualTreeHelper::GetChildrenCount(root);
     for (int i = 0; i < count; i++) {
-        auto part = VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
+        auto part =
+            VisualTreeHelper::GetChild(root, i).try_as<FrameworkElement>();
         if (!part) {
             continue;
         }
@@ -861,11 +869,12 @@ bool EnsureParts() {
     if (GetTickCount64() < g_parts.nextLookup) {
         return g_parts.root.get() && g_parts.dock.get() && g_parts.tray.get();
     }
-    const ULONGLONG nextLookup = GetTickCount64() + 1000;
+    const ULONGLONG nextLookup = GetTickCount64() + kPartsLookupRetryMs;
     try {
         if (FindParts(g_taskbar)) {
-            if (!g_parts.startButton.get() || !g_parts.showDesktop.get())
+            if (!g_parts.startButton.get() || !g_parts.showDesktop.get()) {
                 g_parts.nextLookup = nextLookup;
+            }
             return true;
         }
     } catch (winrt::hresult_error const& e) {
@@ -920,37 +929,36 @@ void NudgeRegionAfterRender() {
         return;
     }
     try {
-        g_regionNudgeToken =
-            CompositionTarget::Rendering([](auto const&, auto const&) {
-                try {
-                    auto root = g_parts.root.get();
-                    auto dock = g_parts.dock.get();
-                    if (!root || !dock ||
-                        g_unloading.load(std::memory_order_acquire) ||
-                        ++g_regionNudgeFrames > kRegionWatchFrames) {
-                        StopRegionNudge();
-                        return;
-                    }
-
-                    // Checked on the dock: the tray's transform also scales
-                    // during its pop, and both are attached together.
-                    const double measured =
-                        dock.TransformToVisual(root).TransformPoint({0, 0}).X;
-                    if (std::abs(measured - (dock.ActualOffset().x +
-                                             RenderedShift(dock))) >= 0.5) {
-                        return;
-                    }
-
+        g_regionNudgeToken = CompositionTarget::Rendering([](auto const&,
+                                                             auto const&) {
+            try {
+                auto root = g_parts.root.get();
+                auto dock = g_parts.dock.get();
+                if (!root || !dock ||
+                    g_unloading.load(std::memory_order_acquire) ||
+                    ++g_regionNudgeFrames > kRegionWatchFrames) {
                     StopRegionNudge();
-                    dock.InvalidateArrange();
-                    root.InvalidateArrange();
-                    root.UpdateLayout();
-                    Trace(L"region settled after %d frame(s)",
-                          g_regionNudgeFrames);
-                } catch (...) {
-                    StopRegionNudge();
+                    return;
                 }
-            });
+
+                // Checked on the dock: the tray's transform also scales
+                // during its pop, and both are attached together.
+                const double measured =
+                    dock.TransformToVisual(root).TransformPoint({0, 0}).X;
+                if (std::abs(measured - (dock.ActualOffset().x +
+                                         RenderedShift(dock))) >= 0.5) {
+                    return;
+                }
+
+                StopRegionNudge();
+                dock.InvalidateArrange();
+                root.InvalidateArrange();
+                root.UpdateLayout();
+                Trace(L"region settled after %d frame(s)", g_regionNudgeFrames);
+            } catch (...) {
+                StopRegionNudge();
+            }
+        });
     } catch (...) {
         g_regionNudgeToken = {};
     }
@@ -977,10 +985,11 @@ void UpdateGroupedLayout(bool syncLayout) {
         const Thickness trayBorder = PanelBorder(trayPill);
 
         const double rootWidth = root.ActualWidth();
-        const double dockLeft = dock.ActualOffset().x + dockPill.ActualOffset().x;
+        const double dockLeft =
+            dock.ActualOffset().x + dockPill.ActualOffset().x;
         const double dockWidth = dockPill.ActualWidth();
-        const double trayLeft = tray.ActualOffset().x +
-                                trayPill.ActualOffset().x + trayBorder.Left;
+        const double trayLeft =
+            tray.ActualOffset().x + trayPill.ActualOffset().x + trayBorder.Left;
         const double trayWidth =
             trayPill.ActualWidth() - trayBorder.Left - trayBorder.Right;
 
@@ -1026,7 +1035,7 @@ void UpdateGroupedLayout(bool syncLayout) {
         Trace(L"grouped layout failed: 0x%08X %s",
               static_cast<unsigned>(e.code()), e.message().c_str());
         g_parts = DockParts{};
-        g_parts.nextLookup = GetTickCount64() + 1000;
+        g_parts.nextLookup = GetTickCount64() + kPartsLookupRetryMs;
     }
 }
 
@@ -1080,6 +1089,7 @@ constexpr double kLoneCornerGaps = 4;
 HINSTANCE ModuleInstance() {
     return reinterpret_cast<HINSTANCE>(&__ImageBase);
 }
+
 ATOM g_cornerClass = 0;
 HWND g_cornerWnd[2] = {};
 
@@ -1101,6 +1111,7 @@ struct CornerPlacement {
                close(band[0], other.band[0]) && close(band[1], other.band[1]);
     }
 };
+
 constexpr double kCornerToleranceDip = 4;
 std::optional<CornerPlacement> g_cornerPlacement;
 
@@ -1110,14 +1121,15 @@ constexpr WPARAM kTrayCommandToggleDesktop = 407;
 // Start and Show desktop are asked of the taskbar directly. Injected Win key
 // presses (Win, Win+D) were sent but had no effect on 26200.
 void RequestCornerStart();
+
 void InvokeCorner(CornerKind kind) {
     BOOL posted = FALSE;
     if (kind == CornerKind::Start) {
         RequestCornerStart();
         posted = PostMessageW(g_taskbar, WM_SYSCOMMAND, SC_TASKLIST, 0);
     } else {
-        posted = PostMessageW(g_taskbar, WM_COMMAND, kTrayCommandToggleDesktop,
-                              0);
+        posted =
+            PostMessageW(g_taskbar, WM_COMMAND, kTrayCommandToggleDesktop, 0);
     }
     Trace(L"corner %s click: posted %d (error %lu)",
           kind == CornerKind::Start ? L"Start" : L"Desktop", posted,
@@ -1129,40 +1141,40 @@ LRESULT CALLBACK CornerWndProc(HWND hWnd,
                                WPARAM wParam,
                                LPARAM lParam) {
     switch (message) {
-        case WM_MOUSEACTIVATE:
-            // Keep the focus (and an open Start menu) where it is.
-            return MA_NOACTIVATE;
+    case WM_MOUSEACTIVATE:
+        // Keep the focus (and an open Start menu) where it is.
+        return MA_NOACTIVATE;
 
-        case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-            return TRUE;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
 
-        case WM_LBUTTONDOWN:
-            SetCapture(hWnd);
-            return 0;
+    case WM_LBUTTONDOWN:
+        SetCapture(hWnd);
+        return 0;
 
-        case WM_LBUTTONUP: {
-            if (GetCapture() != hWnd) {
-                return 0;
-            }
-            ReleaseCapture();
-            // Like a button: only act if released over the target.
-            POINT pt{static_cast<short>(LOWORD(lParam)),
-                     static_cast<short>(HIWORD(lParam))};
-            ClientToScreen(hWnd, &pt);
-            if (WindowFromPoint(pt) == hWnd) {
-                InvokeCorner(static_cast<CornerKind>(
-                    GetWindowLongPtrW(hWnd, GWLP_USERDATA)));
-            }
+    case WM_LBUTTONUP: {
+        if (GetCapture() != hWnd) {
             return 0;
         }
-
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            BeginPaint(hWnd, &ps);
-            EndPaint(hWnd, &ps);
-            return 0;
+        ReleaseCapture();
+        // Like a button: only act if released over the target.
+        POINT pt{static_cast<short>(LOWORD(lParam)),
+                 static_cast<short>(HIWORD(lParam))};
+        ClientToScreen(hWnd, &pt);
+        if (WindowFromPoint(pt) == hWnd) {
+            InvokeCorner(static_cast<CornerKind>(
+                GetWindowLongPtrW(hWnd, GWLP_USERDATA)));
         }
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hWnd, &ps);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
     }
     return DefWindowProcW(hWnd, message, wParam, lParam);
 }
@@ -1181,11 +1193,11 @@ HWND CreateCornerWindow(HWND taskbar, CornerKind kind) {
 
     // Owned by the taskbar, so it always stays above it. No redirection
     // bitmap: nothing is drawn, the window only takes the mouse.
-    HWND hWnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-            WS_EX_NOREDIRECTIONBITMAP,
-        kCornerClassName, nullptr, WS_POPUP, 0, 0, 0, 0, taskbar, nullptr,
-        ModuleInstance(), nullptr);
+    HWND hWnd =
+        CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+                            WS_EX_NOREDIRECTIONBITMAP,
+                        kCornerClassName, nullptr, WS_POPUP, 0, 0, 0, 0,
+                        taskbar, nullptr, ModuleInstance(), nullptr);
     if (hWnd) {
         SetWindowLongPtrW(hWnd, GWLP_USERDATA, static_cast<LONG_PTR>(kind));
     }
@@ -1218,10 +1230,10 @@ void DestroyCornerTargets() {
 winrt::Windows::Foundation::Rect BoundsIn(FrameworkElement const& element,
                                           UIElement const& root,
                                           Thickness const& inset = {}) {
-    const float width = static_cast<float>(element.ActualWidth() -
-                                           inset.Left - inset.Right);
-    const float height = static_cast<float>(element.ActualHeight() -
-                                            inset.Top - inset.Bottom);
+    const float width =
+        static_cast<float>(element.ActualWidth() - inset.Left - inset.Right);
+    const float height =
+        static_cast<float>(element.ActualHeight() - inset.Top - inset.Bottom);
     return element.TransformToVisual(root).TransformBounds(
         {static_cast<float>(inset.Left), static_cast<float>(inset.Top),
          std::max(width, 0.0f), std::max(height, 0.0f)});
@@ -1361,8 +1373,8 @@ void SyncCornerTargets(HWND taskbar) {
         CombineRgn(region, region, band, RGN_OR);
         DeleteObject(band);
 
-        SetWindowPos(g_cornerWnd[i], HWND_TOPMOST, left, taskbarRect.top,
-                     width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowPos(g_cornerWnd[i], HWND_TOPMOST, left, taskbarRect.top, width,
+                     height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         SetWindowRgn(g_cornerWnd[i], region, FALSE);
     }
 
@@ -1383,14 +1395,17 @@ void SyncCornerTargets(HWND taskbar) {
 constexpr wchar_t kQuickSettingsClass[] = L"ControlCenterWindow";
 constexpr int kQuickSettingsChecks = 12;
 constexpr UINT kQuickSettingsCheckMs = 25;
-constexpr wchar_t kQuickSettingsHoldProperty[] = L"FloatingDock.QuickSettingsHoldOpen";
+constexpr wchar_t kQuickSettingsHoldProperty[] =
+    L"FloatingDock.QuickSettingsHoldOpen";
 
 HWINEVENTHOOK g_flyoutShowHook = nullptr;
 HWINEVENTHOOK g_flyoutUncloakHook = nullptr;
 HWINEVENTHOOK g_flyoutMenuHook = nullptr;
-UINT_PTR g_panelEventTimer{};
-HWND g_quickSettingsDirty{};
-bool g_panelEventDirty{}, g_xamlPopupDirty{}, g_panelCoordinatorStarted{};
+UINT_PTR g_panelEventTimer = 0;
+HWND g_quickSettingsDirty = nullptr;
+bool g_panelEventDirty = false;
+bool g_xamlPopupDirty = false;
+bool g_panelCoordinatorStarted = false;
 void SyncPanelTimer();
 void StartFlyoutPlacement();
 void StopFlyoutPlacement();
@@ -1400,81 +1415,120 @@ int g_quickSettingsChecksLeft = 0;
 
 // Included inside the Explorer implementation namespace. All mutable state
 // and callbacks belong to the primary taskbar's XAML dispatcher thread.
-enum class PanelKind { None, Start, Search, Quick, Notifications, Overflow, Menu, TaskView };
+enum class PanelKind {
+    None,
+    Start,
+    Search,
+    Quick,
+    Notifications,
+    Overflow,
+    Menu,
+    TaskView,
+};
 constexpr wchar_t kPanelHold[] = L"FloatingDock.PanelHold.v1";
 constexpr wchar_t kPanelEpoch[] = L"FloatingDock.PanelEpoch.v1";
 constexpr wchar_t kPanelReady[] = L"FloatingDock.PanelBridgeReady.v1";
+
 struct PanelRecord {
-    HWND window{};
-    DWORD process{}, thread{};
-    PanelKind kind{};
+    HWND window = nullptr;
+    DWORD process = 0;
+    DWORD thread = 0;
+    PanelKind kind = PanelKind::None;
 };
+
 struct PanelSession {
-    PanelKind current{}, requested{};
-    HWND window{};
-    ULONGLONG deadline{};
-    bool held{};
+    PanelKind current = PanelKind::None;
+    PanelKind requested = PanelKind::None;
+    HWND window = nullptr;
+    ULONGLONG deadline = 0;
+    bool held = false;
 };
+
 PanelSession g_panelSession;
-UINT_PTR g_panelRequestId{};
-UINT_PTR g_holdSessionId{};
+UINT_PTR g_panelRequestId = 0;
+UINT_PTR g_holdSessionId = 0;
 std::vector<PanelRecord> g_panelRegistry;
-UINT_PTR g_panelTimer{};
-UINT g_panelClosedMessage{};
+UINT_PTR g_panelTimer = 0;
+UINT g_panelClosedMessage = 0;
 winrt::weak_ref<FrameworkElement> g_panelInputRoot;
 Input::PointerEventHandler g_panelPointerHandler{nullptr};
 winrt::Windows::Foundation::IInspectable g_panelHandlerBox{nullptr};
-HHOOK g_panelKeyboardHook{};
-HHOOK g_panelMouseHook{};
-const wchar_t* g_panelCancellation{};
-UINT_PTR g_panelCancelTimer{};
+HHOOK g_panelKeyboardHook = nullptr;
+HHOOK g_panelMouseHook = nullptr;
+const wchar_t* g_panelCancellation = nullptr;
+UINT_PTR g_panelCancelTimer = 0;
+
 struct PanelCounters {
-    ULONGLONG searches{}, timers{}, events{}, coalesced{}, mouse{}, keyboard{};
-    ULONGLONG nextSummary{};
-} g_panelCounters;
-bool g_panelReconciling{};
-bool g_trayClicksHooked{};
-bool g_trayClickModuleSeen{};
+    ULONGLONG searches = 0;
+    ULONGLONG timers = 0;
+    ULONGLONG events = 0;
+    ULONGLONG coalesced = 0;
+    ULONGLONG mouse = 0;
+    ULONGLONG keyboard = 0;
+    ULONGLONG nextSummary = 0;
+};
+
+PanelCounters g_panelCounters;
+bool g_panelReconciling = false;
+bool g_trayClicksHooked = false;
+bool g_trayClickModuleSeen = false;
+
 struct PendingPanelActivation {
     winrt::weak_ref<FrameworkElement> button;
-    HWND oldWindow{};
-    UINT_PTR requestId{};
-    PanelKind target{};
-    bool released{}, closeCompleted{};
+    HWND oldWindow = nullptr;
+    UINT_PTR requestId = 0;
+    PanelKind target = PanelKind::None;
+    bool released = false;
+    bool closeCompleted = false;
 };
+
 PendingPanelActivation g_pendingPanelActivation;
 
 void CALLBACK PanelCloseCompleted(HWND, UINT, ULONG_PTR requestId, LRESULT) {
-    if (!g_unloading.load() && g_pendingPanelActivation.requestId == requestId)
+    if (!g_unloading.load() &&
+        g_pendingPanelActivation.requestId == requestId) {
         g_pendingPanelActivation.closeCompleted = true;
+    }
 }
 
 void ClearPendingPanelActivation() {
     g_pendingPanelActivation = {};
-    if (g_panelKeyboardHook) UnhookWindowsHookEx(g_panelKeyboardHook);
-    if (g_panelMouseHook) UnhookWindowsHookEx(g_panelMouseHook);
+    if (g_panelKeyboardHook) {
+        UnhookWindowsHookEx(g_panelKeyboardHook);
+    }
+    if (g_panelMouseHook) {
+        UnhookWindowsHookEx(g_panelMouseHook);
+    }
     g_panelKeyboardHook = g_panelMouseHook = nullptr;
-    if (g_panelCancelTimer) KillTimer(nullptr, g_panelCancelTimer);
+    if (g_panelCancelTimer) {
+        KillTimer(nullptr, g_panelCancelTimer);
+    }
     g_panelCancelTimer = 0;
     g_panelCancellation = nullptr;
 }
 
 bool PanelVisible(HWND window) {
-    if (!IsWindow(window) || !IsWindowVisible(window)) return false;
+    if (!IsWindow(window) || !IsWindowVisible(window)) {
+        return false;
+    }
     DWORD cloak = 0;
     return SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloak,
-                                           sizeof(cloak))) && !cloak;
+                                           sizeof(cloak))) &&
+           !cloak;
 }
 
 struct PanelProcessRecord {
-    DWORD pid{};
-    HANDLE handle{};
+    DWORD pid = 0;
+    HANDLE handle = nullptr;
     std::wstring name;
 };
+
 std::vector<PanelProcessRecord> g_panelProcesses;
 
 void ClearPanelProcessCache() {
-    for (auto const& record : g_panelProcesses) CloseHandle(record.handle);
+    for (auto const& record : g_panelProcesses) {
+        CloseHandle(record.handle);
+    }
     g_panelProcesses.clear();
 }
 
@@ -1483,16 +1537,20 @@ std::wstring PanelProcessName(DWORD pid) {
         // A retained process handle identifies this creation, even after PID
         // reuse. Query a new process only once the retained instance exits.
         if (WaitForSingleObject(it->handle, 0) == WAIT_TIMEOUT) {
-            if (it->pid == pid) return it->name;
+            if (it->pid == pid) {
+                return it->name;
+            }
             ++it;
         } else {
             CloseHandle(it->handle);
             it = g_panelProcesses.erase(it);
         }
     }
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
-                                 FALSE, pid);
-    if (!process) return {};
+    HANDLE process = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!process) {
+        return {};
+    }
     wchar_t path[MAX_PATH]{};
     DWORD length = ARRAYSIZE(path);
     if (!QueryFullProcessImageNameW(process, 0, path, &length)) {
@@ -1506,10 +1564,14 @@ std::wstring PanelProcessName(DWORD pid) {
 }
 
 bool PanelPopupOwnedBy(HWND window, HWND owner) {
-    if (!IsWindow(owner)) return false;
+    if (!IsWindow(owner)) {
+        return false;
+    }
     for (HWND current = GetWindow(window, GW_OWNER); current;
          current = GetWindow(current, GW_OWNER)) {
-        if (current == owner) return true;
+        if (current == owner) {
+            return true;
+        }
     }
     return false;
 }
@@ -1520,21 +1582,37 @@ bool TaskbarHasMenuFlyout() {
     // This also covers keyboard Win+X, which has no Win32 menu-mode flag.
     try {
         auto root = g_parts.root.get();
-        if (!root) return false;
+        if (!root) {
+            return false;
+        }
         auto xamlRoot = root.XamlRoot();
-        if (!xamlRoot) return false;
-        for (auto const& popup : VisualTreeHelper::GetOpenPopupsForXamlRoot(xamlRoot)) {
-            if (!popup.IsOpen()) continue;
+        if (!xamlRoot) {
+            return false;
+        }
+        for (auto const& popup :
+             VisualTreeHelper::GetOpenPopupsForXamlRoot(xamlRoot)) {
+            if (!popup.IsOpen()) {
+                continue;
+            }
             std::vector<DependencyObject> pending;
-            if (auto child = popup.Child()) pending.push_back(child);
+            if (auto child = popup.Child()) {
+                pending.push_back(child);
+            }
             // A flyout presenter is near the popup root. Bound the traversal
             // so unrelated popup content cannot turn this into a tree scan.
-            for (size_t index = 0; index < pending.size() && index < 32; ++index) {
+            for (size_t index = 0;
+                 index < pending.size() && index < kMaxPopupNodes; ++index) {
                 auto const element = pending[index];
-                if (element.try_as<Controls::MenuFlyoutPresenter>()) return true;
+                if (element.try_as<Controls::MenuFlyoutPresenter>()) {
+                    return true;
+                }
                 const int count = VisualTreeHelper::GetChildrenCount(element);
-                for (int child = 0; child < count && pending.size() < 32; ++child)
-                    pending.push_back(VisualTreeHelper::GetChild(element, child));
+                for (int child = 0;
+                     child < count && pending.size() < kMaxPopupNodes;
+                     ++child) {
+                    pending.push_back(
+                        VisualTreeHelper::GetChild(element, child));
+                }
             }
         }
     } catch (winrt::hresult_error const&) {
@@ -1546,33 +1624,48 @@ bool TaskbarHasMenuFlyout() {
 void DiscoverPanelWindows() {
     // Validate HWND, PID and thread every reconciliation. A recycled handle
     // cannot inherit an old record. Unknown CoreWindows are never dismissed.
-    if (g_settings.traceToFile) ++g_panelCounters.searches;
+    if (g_settings.traceToFile) {
+        ++g_panelCounters.searches;
+    }
     g_panelRegistry.clear();
     std::optional<bool> menuFlyoutOpen;
-    for (HWND window = FindWindowExW(nullptr, nullptr, nullptr, nullptr); window;
-         window = FindWindowExW(nullptr, window, nullptr, nullptr)) {
+    for (HWND window = FindWindowExW(nullptr, nullptr, nullptr, nullptr);
+         window; window = FindWindowExW(nullptr, window, nullptr, nullptr)) {
         wchar_t cls[96]{};
         GetClassNameW(window, cls, ARRAYSIZE(cls));
         const bool core = !wcscmp(cls, L"Windows.UI.Core.CoreWindow");
         const bool quick = !wcscmp(cls, L"ControlCenterWindow");
-        const bool overflow = !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland");
+        const bool overflow =
+            !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland");
         const bool xamlPopup = !wcscmp(cls, L"Xaml_WindowedPopupClass");
         const bool menu = !wcscmp(cls, L"#32768") || xamlPopup;
-        if (!core && !quick && !overflow && !menu) continue;
-        if (!PanelVisible(window)) continue;
-        DWORD pid{};
+        if (!core && !quick && !overflow && !menu) {
+            continue;
+        }
+        if (!PanelVisible(window)) {
+            continue;
+        }
+        DWORD pid = 0;
         DWORD thread = GetWindowThreadProcessId(window, &pid);
         auto process = PanelProcessName(pid);
         PanelKind kind = PanelKind::None;
-        if (quick && !_wcsicmp(process.c_str(), L"ShellHost.exe")) kind = PanelKind::Quick;
-        else if (overflow && pid == GetCurrentProcessId()) kind = PanelKind::Overflow;
-        else if (core && !_wcsicmp(process.c_str(), L"StartMenuExperienceHost.exe")) kind = PanelKind::Start;
-        else if (core && !_wcsicmp(process.c_str(), L"SearchHost.exe")) kind = PanelKind::Search;
-        else if (core && !_wcsicmp(process.c_str(), L"ShellExperienceHost.exe")) {
+        if (quick && !_wcsicmp(process.c_str(), L"ShellHost.exe")) {
+            kind = PanelKind::Quick;
+        } else if (overflow && pid == GetCurrentProcessId()) {
+            kind = PanelKind::Overflow;
+        } else if (core &&
+                   !_wcsicmp(process.c_str(), L"StartMenuExperienceHost.exe")) {
+            kind = PanelKind::Start;
+        } else if (core && !_wcsicmp(process.c_str(), L"SearchHost.exe")) {
+            kind = PanelKind::Search;
+        } else if (core &&
+                   !_wcsicmp(process.c_str(), L"ShellExperienceHost.exe")) {
             RECT rect{};
             MONITORINFO monitor{sizeof(monitor)};
-            if (GetWindowRect(window, &rect) && GetMonitorInfoW(
-                    MonitorFromWindow(g_taskbar, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            if (GetWindowRect(window, &rect) &&
+                GetMonitorInfoW(
+                    MonitorFromWindow(g_taskbar, MONITOR_DEFAULTTONEAREST),
+                    &monitor)) {
                 // Notification host is a narrow, work-area-height right column.
                 // Jump lists share the process/class but have a compact host.
                 const int height = monitor.rcWork.bottom - monitor.rcWork.top;
@@ -1583,10 +1676,13 @@ void DiscoverPanelWindows() {
                 if (rect.top <= monitor.rcWork.top + 2 &&
                     rect.bottom >= monitor.rcWork.bottom - taskbarHeight - 2 &&
                     rect.right >= monitor.rcWork.right - 2 &&
-                    rect.right - rect.left < width / 2) kind = PanelKind::Notifications;
-                else if (rect.bottom > rect.top && rect.right > rect.left &&
-                    (g_panelSession.requested == PanelKind::Menu ||
-                     g_panelSession.current == PanelKind::Menu)) kind = PanelKind::Menu;
+                    rect.right - rect.left < width / 2) {
+                    kind = PanelKind::Notifications;
+                } else if (rect.bottom > rect.top && rect.right > rect.left &&
+                           (g_panelSession.requested == PanelKind::Menu ||
+                            g_panelSession.current == PanelKind::Menu)) {
+                    kind = PanelKind::Menu;
+                }
             }
         } else if (menu && pid == GetCurrentProcessId()) {
             // Explorer owns both classic and XAML menus. Count only popups
@@ -1595,37 +1691,53 @@ void DiscoverPanelWindows() {
                 PanelPopupOwnedBy(window, g_panelSession.window) ||
                 PanelPopupOwnedBy(window, g_taskbar);
             if (attachedToActiveUi) {
-                if (xamlPopup && !menuFlyoutOpen)
+                if (xamlPopup && !menuFlyoutOpen) {
                     menuFlyoutOpen = TaskbarHasMenuFlyout();
-                if (!xamlPopup || *menuFlyoutOpen) kind = PanelKind::Menu;
+                }
+                if (!xamlPopup || *menuFlyoutOpen) {
+                    kind = PanelKind::Menu;
+                }
             }
         }
-        if (kind != PanelKind::None) g_panelRegistry.push_back({window, pid, thread, kind});
+        if (kind != PanelKind::None) {
+            g_panelRegistry.push_back({window, pid, thread, kind});
+        }
     }
 }
 
 HWND PanelWindow(PanelKind kind) {
     for (auto const& record : g_panelRegistry) {
-        if (record.kind == kind) return record.window;
+        if (record.kind == kind) {
+            return record.window;
+        }
     }
     return nullptr;
 }
 
 void SetPanelHold(bool hold) {
-    if (!IsWindow(g_taskbar)) return;
+    if (!IsWindow(g_taskbar)) {
+        return;
+    }
     if (!GetPropW(g_taskbar, kPanelReady)) {
         // Mixed versions retain the existing Quick Settings bridge only.
-        if (PanelWindow(PanelKind::Quick))
-            SetPropW(g_taskbar, kQuickSettingsHoldProperty, reinterpret_cast<HANDLE>(1));
-        else RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+        if (PanelWindow(PanelKind::Quick)) {
+            SetPropW(g_taskbar, kQuickSettingsHoldProperty,
+                     reinterpret_cast<HANDLE>(1));
+        } else {
+            RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+        }
         return;
     }
     RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
     if (hold) {
         if (!g_panelSession.held) {
-            if (!++g_holdSessionId) ++g_holdSessionId;
-            SetPropW(g_taskbar, kPanelEpoch, reinterpret_cast<HANDLE>(g_holdSessionId));
-            SetPropW(g_taskbar, kPanelHold, reinterpret_cast<HANDLE>(g_holdSessionId));
+            if (!++g_holdSessionId) {
+                ++g_holdSessionId;
+            }
+            SetPropW(g_taskbar, kPanelEpoch,
+                     reinterpret_cast<HANDLE>(g_holdSessionId));
+            SetPropW(g_taskbar, kPanelHold,
+                     reinterpret_cast<HANDLE>(g_holdSessionId));
             g_panelSession.held = true;
         }
     } else if (g_panelSession.held) {
@@ -1636,25 +1748,36 @@ void SetPanelHold(bool hold) {
 }
 
 void ReconcilePanels() {
-    if (!g_panelCoordinatorStarted || g_panelReconciling || g_unloading.load()) return;
+    if (!g_panelCoordinatorStarted || g_panelReconciling ||
+        g_unloading.load()) {
+        return;
+    }
     g_panelReconciling = true;
     DiscoverPanelWindows();
     PanelKind actual = PanelKind::None;
     // Prefer the requested target, then the current target; Start's SearchHost
     // proxy isn't a second visible panel. We never count it beside Start.
     if (g_panelSession.requested != PanelKind::None &&
-        PanelWindow(g_panelSession.requested)) actual = g_panelSession.requested;
-    else if (PanelWindow(PanelKind::Start)) {
-        actual = (g_panelSession.current == PanelKind::Search && PanelWindow(PanelKind::Search))
-                    ? PanelKind::Search : PanelKind::Start;
+        PanelWindow(g_panelSession.requested)) {
+        actual = g_panelSession.requested;
+    } else if (PanelWindow(PanelKind::Start)) {
+        actual = (g_panelSession.current == PanelKind::Search &&
+                  PanelWindow(PanelKind::Search))
+                     ? PanelKind::Search
+                     : PanelKind::Start;
     } else {
-        for (PanelKind kind : {PanelKind::Search, PanelKind::Quick,
-                             PanelKind::Notifications, PanelKind::Overflow, PanelKind::Menu}) {
-            if (PanelWindow(kind)) { actual = kind; break; }
+        for (PanelKind kind :
+             {PanelKind::Search, PanelKind::Quick, PanelKind::Notifications,
+              PanelKind::Overflow, PanelKind::Menu}) {
+            if (PanelWindow(kind)) {
+                actual = kind;
+                break;
+            }
         }
     }
     const ULONGLONG now = GetTickCount64();
-    if (g_panelSession.requested == PanelKind::TaskView && actual == PanelKind::None) {
+    if (g_panelSession.requested == PanelKind::TaskView &&
+        actual == PanelKind::None) {
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
     }
@@ -1664,20 +1787,23 @@ void ReconcilePanels() {
     } else if (g_panelSession.deadline && now >= g_panelSession.deadline) {
         Trace(L"panel transition expired request=%llu requested=%d actual=%d",
               static_cast<unsigned long long>(g_panelRequestId),
-              static_cast<int>(g_panelSession.requested), static_cast<int>(actual));
+              static_cast<int>(g_panelSession.requested),
+              static_cast<int>(actual));
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
     }
     if (actual != g_panelSession.current) {
         Trace(L"panel state request=%llu %d -> %d window=%p transition=%d",
               static_cast<unsigned long long>(g_panelRequestId),
-              static_cast<int>(g_panelSession.current), static_cast<int>(actual),
-              PanelWindow(actual), g_panelSession.deadline != 0);
+              static_cast<int>(g_panelSession.current),
+              static_cast<int>(actual), PanelWindow(actual),
+              g_panelSession.deadline != 0);
     }
     g_panelSession.current = actual;
     g_panelSession.window = PanelWindow(actual);
-    if (g_panelSession.requested != PanelKind::TaskView)
+    if (g_panelSession.requested != PanelKind::TaskView) {
         SetPanelHold(actual != PanelKind::None || g_panelSession.deadline != 0);
+    }
     g_panelReconciling = false;
     SyncPanelTimer();
 }
@@ -1687,26 +1813,32 @@ LRESULT CALLBACK PanelMouseProc(int, WPARAM, LPARAM);
 
 bool InstallPendingPanelHooks() {
     g_panelKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, PanelKeyboardProc,
-                                          ModuleInstance(), 0);
-    g_panelMouseHook = SetWindowsHookExW(WH_MOUSE_LL, PanelMouseProc,
-                                       ModuleInstance(), 0);
-    if (g_panelKeyboardHook && g_panelMouseHook) return true;
+                                            ModuleInstance(), 0);
+    g_panelMouseHook =
+        SetWindowsHookExW(WH_MOUSE_LL, PanelMouseProc, ModuleInstance(), 0);
+    if (g_panelKeyboardHook && g_panelMouseHook) {
+        return true;
+    }
     ClearPendingPanelActivation();
     return false;
 }
 
 void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
-    if (g_unloading.load() || !GetPropW(g_taskbar, kPanelReady)) return;
+    if (g_unloading.load() || !GetPropW(g_taskbar, kPanelReady)) {
+        return;
+    }
     ReconcilePanels();
     const PanelKind old = g_panelSession.current;
     ClearPendingPanelActivation();
     ++g_panelRequestId;
-    if (!g_panelRequestId) ++g_panelRequestId;
+    if (!g_panelRequestId) {
+        ++g_panelRequestId;
+    }
     if (target == PanelKind::TaskView) {
         // Full-screen Task View owns the native taskbar policy. This is a
         // release of our override, not a request to force-hide the taskbar.
         g_panelSession.requested = target;
-        g_panelSession.deadline = GetTickCount64() + 1000;
+        g_panelSession.deadline = GetTickCount64() + kPanelTransitionTimeoutMs;
         SetPanelHold(false);
         SyncPanelTimer();
         return;
@@ -1718,7 +1850,7 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
         return;
     }
     g_panelSession.requested = target;
-    g_panelSession.deadline = GetTickCount64() + 1000;
+    g_panelSession.deadline = GetTickCount64() + kPanelTransitionTimeoutMs;
     SetPanelHold(true);
     Trace(L"panel input request=%llu old=%d target=%d",
           static_cast<unsigned long long>(g_panelRequestId),
@@ -1727,14 +1859,18 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
         (old == PanelKind::Start || old == PanelKind::Search) &&
         (target == PanelKind::Quick || target == PanelKind::Notifications) &&
         InstallPendingPanelHooks()) {
-        g_pendingPanelActivation = {winrt::make_weak(button), g_panelSession.window,
-                                    g_panelRequestId, target, false, false};
+        g_pendingPanelActivation = {winrt::make_weak(button),
+                                    g_panelSession.window,
+                                    g_panelRequestId,
+                                    target,
+                                    false,
+                                    false};
     }
     // Only pre-close when the target's native IconView activation is safely
     // deferred. Keyboard shortcuts and unrecognized/unhooked tray buttons
     // keep their native shell behavior.
-    const bool canDeferNativeActivation = g_trayClicksHooked &&
-        g_panelKeyboardHook && g_panelMouseHook &&
+    const bool canDeferNativeActivation =
+        g_trayClicksHooked && g_panelKeyboardHook && g_panelMouseHook &&
         g_pendingPanelActivation.requestId == g_panelRequestId;
     if (canDeferNativeActivation &&
         (target == PanelKind::Quick || target == PanelKind::Notifications) &&
@@ -1742,15 +1878,21 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
         if (old == PanelKind::Start && PanelVisible(g_panelSession.window)) {
             // Same Explorer UI thread, before PointerReleased activates B.
             SendMessageW(g_taskbar, WM_SYSCOMMAND, SC_TASKLIST, 0);
-        } else if (old == PanelKind::Search && PanelVisible(g_panelSession.window)) {
+        } else if (old == PanelKind::Search &&
+                   PanelVisible(g_panelSession.window)) {
             // Exact Search root only; proven not to dismiss the new QS root.
             if (!SendMessageCallbackW(g_panelSession.window, WM_SYSCOMMAND,
-                                      SC_CLOSE, 0, PanelCloseCompleted, g_panelRequestId))
+                                      SC_CLOSE, 0, PanelCloseCompleted,
+                                      g_panelRequestId)) {
                 ClearPendingPanelActivation();
+            }
         }
-        if (old == PanelKind::Start && g_pendingPanelActivation.requestId == g_panelRequestId)
+        if (old == PanelKind::Start &&
+            g_pendingPanelActivation.requestId == g_panelRequestId) {
             g_pendingPanelActivation.closeCompleted = true;
-    } else if ((target == PanelKind::Quick || target == PanelKind::Notifications) &&
+        }
+    } else if ((target == PanelKind::Quick ||
+                target == PanelKind::Notifications) &&
                (old == PanelKind::Start || old == PanelKind::Search)) {
         Trace(L"panel native fallback old=%d target=%d: no deferred tray entry",
               static_cast<int>(old), static_cast<int>(target));
@@ -1760,7 +1902,9 @@ void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
 
 void CancelPendingPanelActivation(const wchar_t* reason) {
     const UINT_PTR requestId = g_pendingPanelActivation.requestId;
-    if (!requestId) return;
+    if (!requestId) {
+        return;
+    }
     Trace(L"panel deferred activation canceled request=%llu reason=%s",
           static_cast<unsigned long long>(requestId), reason);
     ClearPendingPanelActivation();
@@ -1773,17 +1917,31 @@ void CancelPendingPanelActivation(const wchar_t* reason) {
 }
 
 PanelKind PanelButton(DependencyObject source) {
-    for (int depth = 0; source && depth < 24; ++depth) {
+    for (int depth = 0; source && depth < kMaxPanelButtonAncestorDepth;
+         ++depth) {
         if (auto element = source.try_as<FrameworkElement>()) {
-            auto id = Automation::AutomationProperties::GetAutomationId(element);
+            auto id =
+                Automation::AutomationProperties::GetAutomationId(element);
             auto name = element.Name();
             auto cls = winrt::get_class_name(element);
-            if (id == L"StartButton") return PanelKind::Start;
-            if (id == L"SearchButton") return PanelKind::Search;
-            if (id == L"TaskViewButton") return PanelKind::TaskView;
-            if (name == L"ControlCenterButton") return PanelKind::Quick;
-            if (name == L"NotificationCenterButton") return PanelKind::Notifications;
-            if (cls == L"SystemTray.ChevronIconView") return PanelKind::Overflow;
+            if (id == L"StartButton") {
+                return PanelKind::Start;
+            }
+            if (id == L"SearchButton") {
+                return PanelKind::Search;
+            }
+            if (id == L"TaskViewButton") {
+                return PanelKind::TaskView;
+            }
+            if (name == L"ControlCenterButton") {
+                return PanelKind::Quick;
+            }
+            if (name == L"NotificationCenterButton") {
+                return PanelKind::Notifications;
+            }
+            if (cls == L"SystemTray.ChevronIconView") {
+                return PanelKind::Overflow;
+            }
         }
         source = VisualTreeHelper::GetParent(source);
     }
@@ -1791,33 +1949,54 @@ PanelKind PanelButton(DependencyObject source) {
 }
 
 bool PanelContextButton(DependencyObject source) {
-    for (int depth = 0; source && depth < 24; ++depth) {
+    for (int depth = 0; source && depth < kMaxPanelButtonAncestorDepth;
+         ++depth) {
         if (auto element = source.try_as<FrameworkElement>()) {
-            auto id = Automation::AutomationProperties::GetAutomationId(element);
-            if (id == L"StartButton" || std::wstring_view(id).starts_with(L"Appid:")) return true;
+            auto id =
+                Automation::AutomationProperties::GetAutomationId(element);
+            if (id == L"StartButton" ||
+                std::wstring_view(id).starts_with(L"Appid:")) {
+                return true;
+            }
         }
         source = VisualTreeHelper::GetParent(source);
     }
     return false;
 }
 
-Automation::Provider::IInvokeProvider PanelInvokeProvider(FrameworkElement const& element) {
-    auto peer = Automation::Peers::FrameworkElementAutomationPeer::CreatePeerForElement(element);
-    if (!peer) return nullptr;
-    if (auto outer = peer.try_as<Automation::Provider::IInvokeProvider>()) return outer;
+Automation::Provider::IInvokeProvider
+PanelInvokeProvider(FrameworkElement const& element) {
+    auto peer =
+        Automation::Peers::FrameworkElementAutomationPeer::CreatePeerForElement(
+            element);
+    if (!peer) {
+        return nullptr;
+    }
+    if (auto outer = peer.try_as<Automation::Provider::IInvokeProvider>()) {
+        return outer;
+    }
     auto pattern = peer.GetPattern(Automation::Peers::PatternInterface::Invoke);
-    if (!pattern) return nullptr;
+    if (!pattern) {
+        return nullptr;
+    }
     Trace(L"panel invoke pattern=%s", winrt::get_class_name(pattern).c_str());
-    if (auto direct = pattern.try_as<Automation::Provider::IInvokeProvider>()) return direct;
-    if (auto boxed = pattern.try_as<winrt::Windows::Foundation::IReference<Automation::Provider::IInvokeProvider>>())
+    if (auto direct = pattern.try_as<Automation::Provider::IInvokeProvider>()) {
+        return direct;
+    }
+    if (auto boxed = pattern.try_as<winrt::Windows::Foundation::IReference<
+                         Automation::Provider::IInvokeProvider>>()) {
         return boxed.Value();
+    }
     return nullptr;
 }
 
 FrameworkElement PanelInvokableButton(DependencyObject source) {
-    for (int depth = 0; source && depth < 24; ++depth) {
+    for (int depth = 0; source && depth < kMaxPanelButtonAncestorDepth;
+         ++depth) {
         if (auto element = source.try_as<FrameworkElement>()) {
-            if (PanelInvokeProvider(element)) return element;
+            if (PanelInvokeProvider(element)) {
+                return element;
+            }
         }
         source = VisualTreeHelper::GetParent(source);
     }
@@ -1826,7 +2005,9 @@ FrameworkElement PanelInvokableButton(DependencyObject source) {
 
 void CompletePanelActivation() {
     auto pending = g_pendingPanelActivation;
-    if (!pending.requestId) return;
+    if (!pending.requestId) {
+        return;
+    }
     if (g_panelCancellation) {
         CancelPendingPanelActivation(g_panelCancellation);
         return;
@@ -1841,11 +2022,17 @@ void CompletePanelActivation() {
         ClearPendingPanelActivation();
         return;
     }
-    const bool expired = !g_panelSession.deadline || GetTickCount64() >= g_panelSession.deadline;
-    if (!expired && (!pending.released || !pending.closeCompleted || PanelVisible(pending.oldWindow))) return;
+    const bool expired =
+        !g_panelSession.deadline || GetTickCount64() >= g_panelSession.deadline;
+    if (!expired && (!pending.released || !pending.closeCompleted ||
+                     PanelVisible(pending.oldWindow))) {
+        return;
+    }
     // Clear and unhook before Invoke: activation can reenter the dispatcher.
     ClearPendingPanelActivation();
-    if (!pending.released) return;
+    if (!pending.released) {
+        return;
+    }
     if (auto button = pending.button.get()) {
         try {
             if (auto invoke = PanelInvokeProvider(button)) {
@@ -1855,48 +2042,73 @@ void CompletePanelActivation() {
                 invoke.Invoke();
             }
         } catch (winrt::hresult_error const& error) {
-            Trace(L"panel invoke failed 0x%08X", static_cast<unsigned>(error.code()));
+            Trace(L"panel invoke failed 0x%08X",
+                  static_cast<unsigned>(error.code()));
         }
     }
 }
 
-using TrayClickPoint_t = bool (*)(void*, winrt::Windows::Foundation::Point const&, bool, bool, int);
+using TrayClickPoint_t =
+    bool (*)(void*, winrt::Windows::Foundation::Point const&, bool, bool, int);
 using TrayClick_t = bool (*)(void*, bool, bool);
-TrayClickPoint_t g_trayClickPointOriginal{};
-TrayClick_t g_trayClickOriginal{};
+TrayClickPoint_t g_trayClickPointOriginal = nullptr;
+TrayClick_t g_trayClickOriginal = nullptr;
 
 bool DeferNativeTrayClick(bool right) {
     if (right || g_unloading.load() || !g_pendingPanelActivation.requestId ||
         g_pendingPanelActivation.requestId != g_panelRequestId ||
         !g_panelKeyboardHook || !g_panelMouseHook ||
-        !OnTaskbarUiThread(g_taskbar)) return false;
+        !OnTaskbarUiThread(g_taskbar)) {
+        return false;
+    }
     g_pendingPanelActivation.released = true;
     Trace(L"panel native activation intercepted request=%llu",
           static_cast<unsigned long long>(g_panelRequestId));
     CompletePanelActivation();
     return true;
 }
-bool TrayClickPointHook(void* object, winrt::Windows::Foundation::Point const& point,
-                        bool right, bool doubleClick, int device) {
-    if (DeferNativeTrayClick(right)) return true;
+
+bool TrayClickPointHook(void* object,
+                        winrt::Windows::Foundation::Point const& point,
+                        bool right,
+                        bool doubleClick,
+                        int device) {
+    if (DeferNativeTrayClick(right)) {
+        return true;
+    }
     return g_trayClickPointOriginal(object, point, right, doubleClick, device);
 }
+
 bool TrayClickHook(void* object, bool right, bool doubleClick) {
-    if (DeferNativeTrayClick(right)) return true;
+    if (DeferNativeTrayClick(right)) {
+        return true;
+    }
     return g_trayClickOriginal(object, right, doubleClick);
 }
+
 bool HookTrayClicks() {
-    if (g_trayClicksHooked) return true;
+    if (g_trayClicksHooked) {
+        return true;
+    }
     HMODULE module = GetModuleHandleW(L"SystemTray.dll");
-    if (!module) return false;
+    if (!module) {
+        return false;
+    }
     g_trayClickModuleSeen = true;
-    void* point = QsPanelEscape::detail::FindExactDecoratedSymbol(module,
+    void* point = QsPanelEscape::detail::FindExactDecoratedSymbol(
+        module,
         L"?OnClicked@IconView@implementation@SystemTray@winrt@@IEAA_NAEBUPoint@Foundation@Windows@4@_N1W4PointerDeviceType@Input@Devices@74@@Z");
-    void* click = QsPanelEscape::detail::FindExactDecoratedSymbol(module,
+    void* click = QsPanelEscape::detail::FindExactDecoratedSymbol(
+        module,
         L"?OnClicked@IconView@implementation@SystemTray@winrt@@QEAA_N_N0@Z");
-    if (!point || !click) return false;
-    if (!Wh_SetFunctionHook(point, reinterpret_cast<void*>(TrayClickPointHook), reinterpret_cast<void**>(&g_trayClickPointOriginal)) ||
-        !Wh_SetFunctionHook(click, reinterpret_cast<void*>(TrayClickHook), reinterpret_cast<void**>(&g_trayClickOriginal))) {
+    if (!point || !click) {
+        return false;
+    }
+    if (!Wh_SetFunctionHook(
+            point, reinterpret_cast<void*>(TrayClickPointHook),
+            reinterpret_cast<void**>(&g_trayClickPointOriginal)) ||
+        !Wh_SetFunctionHook(click, reinterpret_cast<void*>(TrayClickHook),
+                            reinterpret_cast<void**>(&g_trayClickOriginal))) {
         Wh_RemoveFunctionHook(point);
         Wh_RemoveFunctionHook(click);
         return false;
@@ -1909,43 +2121,68 @@ bool HookTrayClicks() {
 winrt::Windows::Foundation::IInspectable PanelHandlerInspectable() {
     return g_panelHandlerBox;
 }
+
 void AttachPanelInput() {
     auto root = g_parts.root.get();
-    if (!root || root == g_panelInputRoot.get()) return;
-    if (auto old = g_panelInputRoot.get(); old && g_panelPointerHandler)
-        old.RemoveHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable());
-    g_panelPointerHandler = Input::PointerEventHandler([](auto const&, Input::PointerRoutedEventArgs const& args) {
-        try {
-            if (g_unloading.load()) return;
-            if (g_pendingPanelActivation.requestId)
-                CancelPendingPanelActivation(L"taskbar pointer button");
-            auto root = g_panelInputRoot.get();
-            if (!root) return;
-            auto point = args.GetCurrentPoint(root);
-            PanelKind target = PanelButton(args.OriginalSource().try_as<DependencyObject>());
-            if (point.Properties().IsRightButtonPressed())
-                target = PanelContextButton(args.OriginalSource().try_as<DependencyObject>())
-                            ? PanelKind::Menu : PanelKind::None;
-            if (target != PanelKind::None) {
-                FrameworkElement button{nullptr};
-                if (!point.Properties().IsRightButtonPressed() &&
-                    (target == PanelKind::Quick || target == PanelKind::Notifications))
-                    button = PanelInvokableButton(args.OriginalSource().try_as<DependencyObject>());
-                RequestPanel(target, button);
+    if (!root || root == g_panelInputRoot.get()) {
+        return;
+    }
+    if (auto old = g_panelInputRoot.get(); old && g_panelPointerHandler) {
+        old.RemoveHandler(UIElement::PointerPressedEvent(),
+                          PanelHandlerInspectable());
+    }
+    g_panelPointerHandler = Input::PointerEventHandler(
+        [](auto const&, Input::PointerRoutedEventArgs const& args) {
+            try {
+                if (g_unloading.load()) {
+                    return;
+                }
+                if (g_pendingPanelActivation.requestId) {
+                    CancelPendingPanelActivation(L"taskbar pointer button");
+                }
+                auto root = g_panelInputRoot.get();
+                if (!root) {
+                    return;
+                }
+                auto point = args.GetCurrentPoint(root);
+                PanelKind target = PanelButton(
+                    args.OriginalSource().try_as<DependencyObject>());
+                if (point.Properties().IsRightButtonPressed()) {
+                    target =
+                        PanelContextButton(
+                            args.OriginalSource().try_as<DependencyObject>())
+                            ? PanelKind::Menu
+                            : PanelKind::None;
+                }
+                if (target != PanelKind::None) {
+                    FrameworkElement button{nullptr};
+                    if (!point.Properties().IsRightButtonPressed() &&
+                        (target == PanelKind::Quick ||
+                         target == PanelKind::Notifications)) {
+                        button = PanelInvokableButton(
+                            args.OriginalSource().try_as<DependencyObject>());
+                    }
+                    RequestPanel(target, button);
+                }
+            } catch (winrt::hresult_error const& error) {
+                Trace(L"panel input failed 0x%08X",
+                      static_cast<unsigned>(error.code()));
             }
-        } catch (winrt::hresult_error const& error) {
-            Trace(L"panel input failed 0x%08X", static_cast<unsigned>(error.code()));
-        }
-    });
+        });
     g_panelHandlerBox = winrt::box_value(g_panelPointerHandler);
-    root.AddHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable(), true);
+    root.AddHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable(),
+                    true);
     g_panelInputRoot = winrt::make_weak(root);
     Trace(L"panel input attached root=%p", winrt::get_abi(root));
 }
 
 void CALLBACK PanelTimerProc(HWND, UINT, UINT_PTR, DWORD) {
-    if (g_unloading.load() || !g_panelCoordinatorStarted) return;
-    if (g_settings.traceToFile) ++g_panelCounters.timers;
+    if (g_unloading.load() || !g_panelCoordinatorStarted) {
+        return;
+    }
+    if (g_settings.traceToFile) {
+        ++g_panelCounters.timers;
+    }
     ReconcilePanels();
     CompletePanelActivation();
     SyncPanelTimer();
@@ -1953,78 +2190,110 @@ void CALLBACK PanelTimerProc(HWND, UINT, UINT_PTR, DWORD) {
 
 void SyncPanelTimer() {
     const bool active = g_panelCoordinatorStarted &&
-        (g_panelSession.held || g_panelSession.deadline ||
-         g_pendingPanelActivation.requestId);
-    if (active && !g_panelTimer)
-        g_panelTimer = SetTimer(nullptr, 0, 100, PanelTimerProc);
-    else if (!active && g_panelTimer) {
+                        (g_panelSession.held || g_panelSession.deadline ||
+                         g_pendingPanelActivation.requestId);
+    if (active && !g_panelTimer) {
+        g_panelTimer =
+            SetTimer(nullptr, 0, kPanelSafetyCheckMs, PanelTimerProc);
+    } else if (!active && g_panelTimer) {
         KillTimer(nullptr, g_panelTimer);
         g_panelTimer = 0;
     }
 }
 
-void RequestCornerStart() { RequestPanel(PanelKind::Start); }
+void RequestCornerStart() {
+    RequestPanel(PanelKind::Start);
+}
 
 void CALLBACK PanelCancelTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
     KillTimer(nullptr, timer);
     g_panelCancelTimer = 0;
     const auto reason = g_panelCancellation;
     g_panelCancellation = nullptr;
-    if (reason && !g_unloading.load()) CancelPendingPanelActivation(reason);
+    if (reason && !g_unloading.load()) {
+        CancelPendingPanelActivation(reason);
+    }
 }
 
 void MarkPanelCancellation(const wchar_t* reason) {
-    if (!g_pendingPanelActivation.requestId) return;
+    if (!g_pendingPanelActivation.requestId) {
+        return;
+    }
     g_panelCancellation = reason;
-    if (!g_panelCancelTimer)
-        g_panelCancelTimer = SetTimer(nullptr, 0, 1, PanelCancelTimerProc);
+    if (!g_panelCancelTimer) {
+        g_panelCancelTimer = SetTimer(nullptr, 0, kPanelCancellationDeferMs,
+                                      PanelCancelTimerProc);
+    }
 }
 
 LRESULT CALLBACK PanelKeyboardProc(int code, WPARAM message, LPARAM data) {
-    if (g_settings.traceToFile) ++g_panelCounters.keyboard;
+    if (g_settings.traceToFile) {
+        ++g_panelCounters.keyboard;
+    }
     if (code == HC_ACTION && !g_unloading.load() &&
         (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)) {
-        const DWORD key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data)->vkCode;
-        if (key == VK_ESCAPE) MarkPanelCancellation(L"Escape");
-        else if (key == VK_LWIN || key == VK_RWIN)
+        const DWORD key =
+            reinterpret_cast<const KBDLLHOOKSTRUCT*>(data)->vkCode;
+        if (key == VK_ESCAPE) {
+            MarkPanelCancellation(L"Escape");
+        } else if (key == VK_LWIN || key == VK_RWIN) {
             MarkPanelCancellation(L"new shortcut");
+        }
     }
     return CallNextHookEx(nullptr, code, message, data);
 }
 
 LRESULT CALLBACK PanelMouseProc(int code, WPARAM message, LPARAM data) {
-    if (g_settings.traceToFile) ++g_panelCounters.mouse;
+    if (g_settings.traceToFile) {
+        ++g_panelCounters.mouse;
+    }
     if (code == HC_ACTION && !g_unloading.load() &&
         (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
-         message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN))
+         message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN)) {
         MarkPanelCancellation(L"mouse button");
+    }
     return CallNextHookEx(nullptr, code, message, data);
 }
 
 void StartPanelCoordinator() {
-    if (g_panelCoordinatorStarted || !GetPropW(g_taskbar, kPanelReady)) return;
-    if (!g_panelClosedMessage)
-        g_panelClosedMessage = RegisterWindowMessageW(L"FloatingDock.PanelSessionClosed.v1");
-    if (!g_panelClosedMessage) return;
+    if (g_panelCoordinatorStarted || !GetPropW(g_taskbar, kPanelReady)) {
+        return;
+    }
+    if (!g_panelClosedMessage) {
+        g_panelClosedMessage =
+            RegisterWindowMessageW(L"FloatingDock.PanelSessionClosed.v1");
+    }
+    if (!g_panelClosedMessage) {
+        return;
+    }
     g_panelCoordinatorStarted = true;
-    g_holdSessionId = reinterpret_cast<UINT_PTR>(GetPropW(g_taskbar, kPanelEpoch));
-    if (!g_trayClicksHooked && !g_trayClickModuleSeen && HookTrayClicks())
+    g_holdSessionId =
+        reinterpret_cast<UINT_PTR>(GetPropW(g_taskbar, kPanelEpoch));
+    if (!g_trayClicksHooked && !g_trayClickModuleSeen && HookTrayClicks()) {
         Wh_ApplyHookOperations();
+    }
     StopFlyoutPlacement();
     StartFlyoutPlacement();
     ReconcilePanels();
-    try { AttachPanelInput(); } catch (winrt::hresult_error const& error) {
-        Trace(L"panel attach failed 0x%08X", static_cast<unsigned>(error.code()));
+    try {
+        AttachPanelInput();
+    } catch (winrt::hresult_error const& error) {
+        Trace(L"panel attach failed 0x%08X",
+              static_cast<unsigned>(error.code()));
     }
 }
 
 void StopPanelCoordinator() {
     g_panelCoordinatorStarted = false;
     ClearPendingPanelActivation();
-    if (g_panelTimer) KillTimer(nullptr, g_panelTimer);
+    if (g_panelTimer) {
+        KillTimer(nullptr, g_panelTimer);
+    }
     g_panelTimer = 0;
-    if (auto root = g_panelInputRoot.get(); root && g_panelPointerHandler)
-        root.RemoveHandler(UIElement::PointerPressedEvent(), PanelHandlerInspectable());
+    if (auto root = g_panelInputRoot.get(); root && g_panelPointerHandler) {
+        root.RemoveHandler(UIElement::PointerPressedEvent(),
+                           PanelHandlerInspectable());
+    }
     g_panelInputRoot = {};
     g_panelPointerHandler = nullptr;
     g_panelHandlerBox = nullptr;
@@ -2035,7 +2304,9 @@ void StopPanelCoordinator() {
     ClearPanelProcessCache();
     g_panelSession = {};
     StopFlyoutPlacement();
-    if (!g_unloading.load()) StartFlyoutPlacement();
+    if (!g_unloading.load()) {
+        StartFlyoutPlacement();
+    }
 }
 
 void StopQuickSettingsWatch() {
@@ -2045,11 +2316,12 @@ void StopQuickSettingsWatch() {
     }
     g_quickSettings = nullptr;
     g_quickSettingsChecksLeft = 0;
-
 }
 
 void PlaceQuickSettings(HWND hWnd) {
-    if (!g_settings.groupedDock) return;
+    if (!g_settings.groupedDock) {
+        return;
+    }
     HWND taskbar = g_taskbar;
     RECT rect{};
     MONITORINFO monitorInfo{sizeof(monitorInfo)};
@@ -2071,8 +2343,8 @@ void PlaceQuickSettings(HWND hWnd) {
 
     SetWindowPos(hWnd, nullptr, left, rect.top, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    Trace(L"quick settings moved: x %ld -> %d (tray shift %.1f DIP)",
-          rect.left, left, g_trayShiftDip);
+    Trace(L"quick settings moved: x %ld -> %d (tray shift %.1f DIP)", rect.left,
+          left, g_trayShiftDip);
 }
 
 // Windows may still place the window while its entrance animation starts;
@@ -2083,27 +2355,37 @@ void CALLBACK QuickSettingsTimerProc(HWND, UINT, UINT_PTR, DWORD) {
         return;
     }
     PlaceQuickSettings(g_quickSettings);
-    if (--g_quickSettingsChecksLeft <= 0) StopQuickSettingsWatch();
+    if (--g_quickSettingsChecksLeft <= 0) {
+        StopQuickSettingsWatch();
+    }
 }
 
 void UpdateLegacyQuickSettingsHold(HWND window) {
-    if (g_panelCoordinatorStarted) return;
-    if (PanelVisible(window))
-        SetPropW(g_taskbar, kQuickSettingsHoldProperty, reinterpret_cast<HANDLE>(1));
-    else RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+    if (g_panelCoordinatorStarted) {
+        return;
+    }
+    if (PanelVisible(window)) {
+        SetPropW(g_taskbar, kQuickSettingsHoldProperty,
+                 reinterpret_cast<HANDLE>(1));
+    } else {
+        RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
+    }
 }
 
 void CALLBACK PanelEventTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
     KillTimer(nullptr, timer);
     g_panelEventTimer = 0;
-    if (g_unloading.load()) return;
+    if (g_unloading.load()) {
+        return;
+    }
     if (g_xamlPopupDirty) {
         g_xamlPopupDirty = false;
         // Hover-only popups must not start a full window discovery or hold.
         // An existing session still needs reconciliation when its menu closes.
         if (g_panelCoordinatorStarted &&
-            (g_panelSession.held || TaskbarHasMenuFlyout()))
+            (g_panelSession.held || TaskbarHasMenuFlyout())) {
             g_panelEventDirty = true;
+        }
     }
     const HWND quick = g_quickSettingsDirty;
     g_quickSettingsDirty = nullptr;
@@ -2116,12 +2398,16 @@ void CALLBACK PanelEventTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
             g_quickSettingsChecksLeft = kQuickSettingsChecks;
             g_quickSettingsTimer = SetTimer(nullptr, 0, kQuickSettingsCheckMs,
                                             QuickSettingsTimerProc);
-        } else if (quick == g_quickSettings) StopQuickSettingsWatch();
+        } else if (quick == g_quickSettings) {
+            StopQuickSettingsWatch();
+        }
     }
     if (g_panelEventDirty) {
         g_panelEventDirty = false;
         if (g_panelCoordinatorStarted) {
-            if (g_settings.traceToFile) ++g_panelCounters.coalesced;
+            if (g_settings.traceToFile) {
+                ++g_panelCounters.coalesced;
+            }
             ReconcilePanels();
             CompletePanelActivation();
             SyncPanelTimer();
@@ -2129,35 +2415,60 @@ void CALLBACK PanelEventTimerProc(HWND, UINT, UINT_PTR timer, DWORD) {
     }
 }
 
-void CALLBACK FlyoutEventProc(HWINEVENTHOOK, DWORD event, HWND window,
-                              LONG object, LONG child, DWORD, DWORD) {
-    if (g_settings.traceToFile) ++g_panelCounters.events;
-    if (g_unloading.load() || !window) return;
+void CALLBACK FlyoutEventProc(HWINEVENTHOOK,
+                              DWORD event,
+                              HWND window,
+                              LONG object,
+                              LONG child,
+                              DWORD,
+                              DWORD) {
+    if (g_settings.traceToFile) {
+        ++g_panelCounters.events;
+    }
+    if (g_unloading.load() || !window) {
+        return;
+    }
     const bool menuEvent = event == EVENT_SYSTEM_MENUPOPUPSTART ||
                            event == EVENT_SYSTEM_MENUPOPUPEND;
-    if (!menuEvent && (object != OBJID_WINDOW || child != CHILDID_SELF)) return;
-    if (GetAncestor(window, GA_ROOT) != window) return;
+    if (!menuEvent && (object != OBJID_WINDOW || child != CHILDID_SELF)) {
+        return;
+    }
+    if (GetAncestor(window, GA_ROOT) != window) {
+        return;
+    }
     wchar_t cls[96]{};
-    if (!GetClassNameW(window, cls, ARRAYSIZE(cls))) return;
+    if (!GetClassNameW(window, cls, ARRAYSIZE(cls))) {
+        return;
+    }
     const bool quick = !wcscmp(cls, kQuickSettingsClass);
     const bool xamlPopup = !wcscmp(cls, L"Xaml_WindowedPopupClass");
-    const bool relevant = quick || !wcscmp(cls, L"Windows.UI.Core.CoreWindow") ||
+    const bool relevant =
+        quick || !wcscmp(cls, L"Windows.UI.Core.CoreWindow") ||
         !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") ||
-        !wcscmp(cls, L"#32768") || xamlPopup ||
-        window == g_panelSession.window;
-    if (!relevant || (!g_panelCoordinatorStarted && !quick)) return;
+        !wcscmp(cls, L"#32768") || xamlPopup || window == g_panelSession.window;
+    if (!relevant || (!g_panelCoordinatorStarted && !quick)) {
+        return;
+    }
     if (xamlPopup) {
-        DWORD pid{};
+        DWORD pid = 0;
         GetWindowThreadProcessId(window, &pid);
         if (pid != GetCurrentProcessId() ||
             (!PanelPopupOwnedBy(window, g_taskbar) &&
-             !PanelPopupOwnedBy(window, g_panelSession.window))) return;
+             !PanelPopupOwnedBy(window, g_panelSession.window))) {
+            return;
+        }
         g_xamlPopupDirty = true;
     }
-    if (quick) g_quickSettingsDirty = window;
-    if (g_panelCoordinatorStarted && !xamlPopup) g_panelEventDirty = true;
-    if (!g_panelEventTimer)
-        g_panelEventTimer = SetTimer(nullptr, 0, 20, PanelEventTimerProc);
+    if (quick) {
+        g_quickSettingsDirty = window;
+    }
+    if (g_panelCoordinatorStarted && !xamlPopup) {
+        g_panelEventDirty = true;
+    }
+    if (!g_panelEventTimer) {
+        g_panelEventTimer =
+            SetTimer(nullptr, 0, kPanelEventCoalesceMs, PanelEventTimerProc);
+    }
 }
 
 // Must run on the taskbar UI thread; the events are delivered there.
@@ -2169,12 +2480,13 @@ void StartFlyoutPlacement() {
     g_flyoutShowHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE,
                                        nullptr, FlyoutEventProc, 0, 0, flags);
     // Legacy Quick Settings can close by cloaking without a HIDE event.
-    g_flyoutUncloakHook = SetWinEventHook(EVENT_OBJECT_CLOAKED,
-        EVENT_OBJECT_UNCLOAKED, nullptr, FlyoutEventProc, 0, 0, flags);
+    g_flyoutUncloakHook =
+        SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr,
+                        FlyoutEventProc, 0, 0, flags);
     if (g_panelCoordinatorStarted) {
-        g_flyoutMenuHook = SetWinEventHook(EVENT_SYSTEM_MENUPOPUPSTART,
-            EVENT_SYSTEM_MENUPOPUPEND, nullptr, FlyoutEventProc,
-            GetCurrentProcessId(), 0, flags);
+        g_flyoutMenuHook = SetWinEventHook(
+            EVENT_SYSTEM_MENUPOPUPSTART, EVENT_SYSTEM_MENUPOPUPEND, nullptr,
+            FlyoutEventProc, GetCurrentProcessId(), 0, flags);
     }
     UpdateGroupedLayout(true);
     if (HWND flyout = FindWindowW(kQuickSettingsClass, nullptr);
@@ -2185,13 +2497,16 @@ void StartFlyoutPlacement() {
 }
 
 void StopFlyoutPlacement() {
-    for (HWINEVENTHOOK* hook : {&g_flyoutShowHook, &g_flyoutUncloakHook, &g_flyoutMenuHook}) {
+    for (HWINEVENTHOOK* hook :
+         {&g_flyoutShowHook, &g_flyoutUncloakHook, &g_flyoutMenuHook}) {
         if (*hook) {
             UnhookWinEvent(*hook);
             *hook = nullptr;
         }
     }
-    if (g_panelEventTimer) KillTimer(nullptr, g_panelEventTimer);
+    if (g_panelEventTimer) {
+        KillTimer(nullptr, g_panelEventTimer);
+    }
     g_panelEventTimer = 0;
     g_panelEventDirty = false;
     g_xamlPopupDirty = false;
@@ -2219,24 +2534,36 @@ void CALLBACK PollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
         return;
     }
     const bool ready = GetPropW(taskbar, kPanelReady) != nullptr;
-    if (ready && !g_panelCoordinatorStarted) StartPanelCoordinator();
-    else if (!ready && g_panelCoordinatorStarted) StopPanelCoordinator();
+    if (ready && !g_panelCoordinatorStarted) {
+        StartPanelCoordinator();
+    } else if (!ready && g_panelCoordinatorStarted) {
+        StopPanelCoordinator();
+    }
     if (g_panelCoordinatorStarted) {
         if (!g_trayClicksHooked && !g_trayClickModuleSeen &&
-            GetModuleHandleW(L"SystemTray.dll") && HookTrayClicks())
+            GetModuleHandleW(L"SystemTray.dll") && HookTrayClicks()) {
             Wh_ApplyHookOperations();
-        try { AttachPanelInput(); } catch (...) {}
+        }
+        try {
+            AttachPanelInput();
+        } catch (...) {
+        }
     }
     if (g_settings.traceToFile) {
         const auto now = GetTickCount64();
-        if (!g_panelCounters.nextSummary) g_panelCounters.nextSummary = now + 60000;
+        if (!g_panelCounters.nextSummary) {
+            g_panelCounters.nextSummary = now + kPanelMetricsWindowMs;
+        }
         if (now >= g_panelCounters.nextSummary) {
-            Trace(L"efficiency searches=%llu timers=%llu events=%llu coalesced=%llu mouse=%llu keyboard=%llu hooks=%d active=%d bridge=%d",
-                g_panelCounters.searches, g_panelCounters.timers, g_panelCounters.events,
-                g_panelCounters.coalesced, g_panelCounters.mouse, g_panelCounters.keyboard,
-                !!g_panelMouseHook + !!g_panelKeyboardHook, !!g_panelTimer, ready);
+            Trace(
+                L"efficiency searches=%llu timers=%llu events=%llu coalesced=%llu mouse=%llu keyboard=%llu hooks=%d active=%d bridge=%d",
+                g_panelCounters.searches, g_panelCounters.timers,
+                g_panelCounters.events, g_panelCounters.coalesced,
+                g_panelCounters.mouse, g_panelCounters.keyboard,
+                !!g_panelMouseHook + !!g_panelKeyboardHook, !!g_panelTimer,
+                ready);
             g_panelCounters = {};
-            g_panelCounters.nextSummary = now + 60000;
+            g_panelCounters.nextSummary = now + kPanelMetricsWindowMs;
         }
     }
     if (IsTaskbarHiddenOnScreen(taskbar)) {
@@ -2354,8 +2681,7 @@ bool RunFromWindowThread(HWND hWnd,
             }
             return CallNextHookEx(nullptr, code, wParam, lParam);
         },
-        nullptr,
-        threadId);
+        nullptr, threadId);
 
     if (!hook) {
         return false;
@@ -2455,59 +2781,82 @@ bool HookTaskbarSymbols() {
 }  // namespace
 
 namespace QsHostLoader {
-decltype(&LoadLibraryExW) original{};
-void* target{};
-std::mutex lifecycle;
-std::atomic<bool> stopping{false}, installing{false}, active{false};
+decltype(&LoadLibraryExW) g_loadLibraryOriginal = nullptr;
+void* g_loadLibraryTarget = nullptr;
+std::mutex g_lifecycleMutex;
+std::atomic<bool> g_stopping{false};
+std::atomic<bool> g_installing{false};
+std::atomic<bool> g_active{false};
+
 void Activate() {
-    if (installing.exchange(true)) return;
+    if (g_installing.exchange(true)) {
+        return;
+    }
     {
-        std::lock_guard guard(lifecycle);
-        if (!stopping.load() && GetModuleHandleW(L"ControlCenter.dll") &&
-                QsPanelEscape::InitializeQuickSettingsHost()) {
+        std::lock_guard guard(g_lifecycleMutex);
+        if (!g_stopping.load() && GetModuleHandleW(L"ControlCenter.dll") &&
+            QsPanelEscape::InitializeQuickSettingsHost()) {
             Wh_ApplyHookOperations();
             QsPanelEscape::AfterInitQuickSettingsHost();
-            active.store(true);
+            g_active.store(true);
         }
     }
-    installing.store(false);
+    g_installing.store(false);
 }
+
 HMODULE WINAPI LoadLibraryHook(LPCWSTR path, HANDLE file, DWORD flags) {
-    HMODULE module = original(path, file, flags);
-    if (!module || stopping.load() || active.load()) return module;
-    if (GetModuleHandleW(L"ControlCenter.dll")) Activate();
+    HMODULE module = g_loadLibraryOriginal(path, file, flags);
+    if (!module || g_stopping.load() || g_active.load()) {
+        return module;
+    }
+    if (GetModuleHandleW(L"ControlCenter.dll")) {
+        Activate();
+    }
     return module;
 }
+
 BOOL Initialize() {
-    stopping.store(false);
+    g_stopping.store(false);
     HMODULE base = GetModuleHandleW(L"kernelbase.dll");
-    target = base ? reinterpret_cast<void*>(GetProcAddress(base, "LoadLibraryExW")) : nullptr;
-    if (!target || !Wh_SetFunctionHook(target,
-            reinterpret_cast<void*>(LoadLibraryHook), reinterpret_cast<void**>(&original))) return FALSE;
+    g_loadLibraryTarget =
+        base ? reinterpret_cast<void*>(GetProcAddress(base, "LoadLibraryExW"))
+             : nullptr;
+    if (!g_loadLibraryTarget ||
+        !Wh_SetFunctionHook(g_loadLibraryTarget,
+                            reinterpret_cast<void*>(LoadLibraryHook),
+                            reinterpret_cast<void**>(&g_loadLibraryOriginal))) {
+        return FALSE;
+    }
     // ShellHost may receive the mod before its Quick Settings module loads.
     // Keep the loader hook active, then register exact ControlCenter hooks.
     if (GetModuleHandleW(L"ControlCenter.dll")) {
-        if (QsPanelEscape::InitializeQuickSettingsHost()) return TRUE;
-        Wh_RemoveFunctionHook(target);
-        target = nullptr;
+        if (QsPanelEscape::InitializeQuickSettingsHost()) {
+            return TRUE;
+        }
+        Wh_RemoveFunctionHook(g_loadLibraryTarget);
+        g_loadLibraryTarget = nullptr;
         return FALSE;
     }
     Wh_Log(L"QS Escape: waiting for ControlCenter.dll");
     return TRUE;
 }
+
 void Uninitialize() {
-    stopping.store(true);
-    std::lock_guard guard(lifecycle);
-    if (target) Wh_RemoveFunctionHook(target);
-    target = nullptr;
-    active.store(false);
+    g_stopping.store(true);
+    std::lock_guard guard(g_lifecycleMutex);
+    if (g_loadLibraryTarget) {
+        Wh_RemoveFunctionHook(g_loadLibraryTarget);
+    }
+    g_loadLibraryTarget = nullptr;
+    g_active.store(false);
     QsPanelEscape::UninitializeQuickSettingsHost();
 }
-}
+}  // namespace QsHostLoader
 
 BOOL Wh_ModInit() {
-    if (QsPanelEscape::detail::IsShellHostProcess())
+    if (QsPanelEscape::detail::IsShellHostProcess()) {
         return QsHostLoader::Initialize();
+    }
     LoadSettings();
     g_unloading.store(false, std::memory_order_release);
     // Windhawk may reuse the same mapped DLL during settings reload. Hooks
@@ -2522,7 +2871,9 @@ BOOL Wh_ModInit() {
     if (!HookTaskbarSymbols()) {
         return FALSE;
     }
-    if (!HookTrayClicks()) Trace(L"panel native tray activation hooks unavailable at init");
+    if (!HookTrayClicks()) {
+        Trace(L"panel native tray activation hooks unavailable at init");
+    }
 
     return TRUE;
 }
