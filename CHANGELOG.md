@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.6 (2026-10-06)
+
+- Stop periodic panel discovery while idle. Coalesce shell window events and
+  use a 100 ms safety check only during an active panel session.
+- Install low-level input hooks only while a tray activation is deferred;
+  keep native clicks intact if hook installation fails.
+- Separate request IDs from dock hold sessions and recover a valid intercepted
+  click exactly once when a transition times out.
+- Reconnect the panel coordinator when Motion becomes available, and preserve
+  the legacy Quick Settings path when the shared bridge is unavailable.
+- Make the native `_Hide` hook optional and cache the primary taskbar context.
+- Remove duplicate Quick Settings visibility polling, cache shell process
+  identities and limit searches for missing optional XAML elements.
+- Keep the 40 ms edge poll and reuse monitor geometry for a stationary cursor.
+  Display changes and taskbar transitions invalidate that cache.
+- Recognize taskbar-owned XAML menus, including Win+X on build 26200, and
+  cancel a deferred activation when a newer Windows shortcut arrives.
+- Verify 75 dock panel transitions plus recovery, cancellation, reload and
+  native fallback cases. See `docs/verification-1.0.6.txt` for measurement
+  scope and limitations.
+
 ## 1.0.5 (2026-10-06)
 
 - Replace the five dock panels with one click and keep the dock visible

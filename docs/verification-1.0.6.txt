@@ -1,0 +1,102 @@
+Floating Dock 1.0.6 verification
+Date: 2026-10-06
+Baseline: upstream/local release 1.0.5, bfa0f83
+Implementation commits: 617ebc8, 26f89b1, 2be2870, 872bfbc, f617372
+
+Scope
+Windows build 26200, one primary bottom taskbar, 2560 x 1440, AC power.
+Both final mod sources compiled with the installed Windhawk clang toolchain.
+No failure-injection constants remain in the release sources.
+Measurements were shortened at the user's request. No ten-minute runs,
+WPR context-switch capture or battery/watt measurement were performed.
+
+Behavior and failure paths
+- Final five-panel matrix: 3 rounds of 25 transitions/toggles, 75/75 passed.
+  Panels: Start, Search, Quick Settings, Notifications and hidden icons.
+  Each result checks the actual target, taskbar position and hold property.
+- Quick Settings Wi-Fi, Bluetooth and audio subpages: interaction, back and
+  Escape preserve the parent session. Moving the cursor outside for 10 seconds
+  preserves the dock; clicking outside closes the panel and releases the hold.
+- Rapid replacement, pending cancellation by Escape/outside click, tray child
+  menus and taskbar-owned XAML menus were exercised.
+- macOS/left layout changes applied the corresponding Windows alignment.
+- Helpers and Motion off/on, reconnection with Quick Settings already open,
+  ShellHost restart and Explorer restart were exercised. Normal panels and
+  hiding resumed. The late-loaded ControlCenter adapter was also exercised.
+- E1: Start by click, Win+S, outside click, dock hide: passed.
+- E2: temporary test build delays the close-completion guard until timeout.
+  The intercepted click recovered once. Escape, outside click and a new Win+S
+  each cancelled it with zero recovery. All four cases passed. This injects
+  the timeout branch; it does not hang a foreign host thread.
+- E3: with the dock initially shown, Win, Win+S/A/N/X each passed 3 trials
+  of panel hold and subsequent close. Win+Tab passed 3 trials under the native
+  Task View exception: no shared hold, dock hidden. Total policy result: 18/18.
+  The raw strict hold-every-panel criterion is 15/18; its three exceptions
+  are those Task View trials, not additional managed-panel failures.
+  Close checks included outside focus/click after Escape; this does not prove
+  that every shortcut closes and hides using Escape alone. An earlier strict
+  hidden-dock test was not used to claim universal keyboard-entry support.
+- E5: with the native _Hide lookup disabled in a test build, Motion loaded,
+  bridge ready and hold stayed zero, and reveal was observed. This did not
+  separately isolate whole-edge reveal from native reveal fallback.
+- E6: forced input-hook installation failure left the click unintercepted and
+  Windows executed it. Native fallback can leave multiple native panels open;
+  the single-panel policy is not guaranteed on that failure path.
+- Final trace-disabled build: Quick Settings open/close and hidden idle checked.
+
+Implementation details affecting efficiency
+Idle coordinator has no periodic discovery or safety timer. Active sessions
+use a 100 ms safety timer; events are coalesced over 20 ms. Pending activation
+alone owns the two low-level input hooks. Quick Settings keeps its initial
+12 x 25 ms placement correction but no separate 100 ms visibility poll.
+Bridge-disabled coordination stops discovery, safety timer and input hooks;
+legacy Quick Settings events remain, including cloak/uncloak for hold release.
+Therefore bridge-disabled mode does not have zero event hooks.
+Global event delivery still has a cost. Per-process WinEvent hooks are deferred.
+Existing 250 ms layout and 40 ms hidden-edge checks remain.
+
+Short efficiency observation
+S2: dock shown, cursor stationary over the dock, no panels or user input.
+Each version was observed for about 61.65 seconds with diagnostics enabled.
+Both captures passed state/input checks and used the same Explorer process.
+
+                              1.0.5          1.0.6
+Explorer CPU time delta       250.000 ms     46.875 ms
+Periodic discovery counter    1001           0
+Panel safety timer counter    960            0
+Installed low-level hooks     2              0
+Candidate event callbacks                    144
+Candidate coalesced searches                  0
+
+Counters come from a diagnostic aggregate window, which is not exactly aligned
+to CPU capture boundaries. Do not compare edge callback rates from these logs.
+This single short observation is not a power or battery benchmark and does not
+establish a stable CPU savings percentage. Event receipt still occurs in idle.
+S1 hidden-dock baseline was valid, but the candidate had input/cursor/state
+changes and was excluded from CPU comparison. No complete S1 CPU conclusion.
+Normal trace-disabled functional checks passed; no separate trace-disabled
+CPU benchmark was taken.
+
+Edge responsiveness (candidate B)
+20 throws to the lower edge per version; all 20 reveals succeeded in each.
+Median: 1.0.5 77.92 ms; cached-geometry 1.0.6 77.97 ms; difference +0.05 ms.
+This meets the planned maximum +20 ms median increase, so candidate B was kept.
+The measure detects reveal start from taskbar window geometry, not animation
+completion. The 40 ms poll is unchanged. Display/taskbar changes invalidate
+the stationary-cursor monitor geometry cache.
+
+Evidence and limits
+Public matrix: panel-efficiency-1.0.6-transition-results.csv.
+Local raw JSON, traces and screenshots were retained in the test workspace;
+screenshots containing unrelated desktop content were not published.
+Some taskbar UIA enumerations returned zero elements on this PC. Tests used
+coordinates from a captured dock band only with matching taskbar/layout guards,
+then checked actual windows/properties; no UIA elements were fabricated.
+Earlier interrupted or input-contaminated rounds are excluded from the final
+75 results. Multi-monitor and other Windows builds remain unverified.
+
+Installed state
+Both registry and Windhawk UI versions are 1.0.6, enabled, diagnostics off.
+Installed source/DLL hashes match final build artifacts. Only normal 1.0.6
+mod DLLs were loaded in Explorer/ShellHost; test variants were restored away.
+macOS layout is enabled, alignment is centered, bridge ready=1, hold=0 in idle.

@@ -67,9 +67,11 @@ Explorer starts (10 DIP wider on the left with left alignment), so without
 this the dock would only look right after a sign-out; with it, switching
 layouts takes effect right away.
 
-## Panel behavior (1.0.5)
+## Panel behavior (1.0.6)
 
-Install both local mods at version 1.0.5 for the shared panel behavior.
+Install both local mods at version 1.0.6 for the shared panel behavior.
+If the optional native hide symbol is unavailable, Motion still loads and
+keeps its animations and edge reveal; the shared panel hold is unavailable.
 
 - Clicking another dock panel button once replaces Start, Search, Quick
   Settings, Notifications/calendar or the hidden-icons panel.
@@ -86,7 +88,13 @@ Install both local mods at version 1.0.5 for the shared panel behavior.
 These rules were verified for dock button entry on the primary, bottom
 taskbar on build 26200. Keyboard shortcuts such as Win+A/Win+N use Windows'
 native fallback; the single-panel policy is not guaranteed for those entry
-paths. See [verification results](docs/verification-1.0.5.txt).
+paths. See [1.0.6 verification results](docs/verification-1.0.6.txt).
+
+Version 1.0.6 stops periodic panel discovery while idle and installs input
+hooks only for a deferred tray activation. A 100 ms safety check runs during
+an active panel session. The existing layout and edge checks remain.
+Short CPU observations and their limits are recorded in the verification
+report; battery or watt savings have not been measured.
 
 ## Settings
 
