@@ -2,7 +2,7 @@
 // @id              taskbar-autohide-motion
 // @name            Taskbar Auto-Hide Motion
 // @description     Smooth slide and pop for the auto-hidden Windows 11 taskbar, invisible while hidden (OLED friendly), revealed along the whole bottom edge
-// @version         1.0.5
+// @version         1.0.6
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -1717,32 +1717,51 @@ void ResetPrimaryTrayUi(HWND taskbar, const wchar_t* reason) {
     }
 }
 
-void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
-    if (!received || !TrayUI_Unhide_Original || g_taskbarCode.empty() ||
-        !IsPrimaryTaskbarWindow(taskbar)) {
+void PublishPanelBridgeReady(HWND taskbar) {
+    if (g_unloading.load(std::memory_order_acquire) ||
+        !g_trayUi.load(std::memory_order_acquire) ||
+        !g_primaryWndProcThis ||
+        g_primaryTaskbar.load(std::memory_order_acquire) != taskbar ||
+        g_primaryTrayUiThreadId.load(std::memory_order_acquire) !=
+            GetCurrentThreadId() ||
+        !g_panelSessionClosedMessage.load(std::memory_order_acquire) ||
+        !TrayUI__Hide_Original || !TrayUI_WndProc_Original) {
         return;
     }
 
-    DWORD pid = 0;
-    DWORD threadId = GetWindowThreadProcessId(taskbar, &pid);
-    if (pid != GetCurrentProcessId() || threadId != GetCurrentThreadId()) {
+    if (!GetPropW(taskbar, kPanelBridgeReadyProperty) &&
+        SetPropW(taskbar, kPanelBridgeReadyProperty,
+                 reinterpret_cast<HANDLE>(1))) {
+        Trace(L"panel bridge: ready on primary taskbar %p", taskbar);
+    }
+}
+
+void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
+    if (!received || !TrayUI_Unhide_Original || g_taskbarCode.empty()) {
         return;
     }
 
     const bool fromWndProc = _wcsicmp(source, L"WndProc") == 0;
     void* currentTrayUi = g_trayUi.load(std::memory_order_acquire);
+    const DWORD currentThreadId = GetCurrentThreadId();
+    const DWORD cachedThreadId =
+        g_primaryTrayUiThreadId.load(std::memory_order_acquire);
     if (fromWndProc && received == g_primaryWndProcThis && currentTrayUi &&
-        g_primaryTaskbar.load(std::memory_order_acquire) == taskbar &&
-        g_primaryTrayUiThreadId.load(std::memory_order_acquire) == threadId) {
-        if (!g_unloading.load(std::memory_order_acquire) &&
-            !GetPropW(taskbar, kPanelBridgeReadyProperty) &&
-            g_panelSessionClosedMessage.load(std::memory_order_acquire) &&
-            TrayUI__Hide_Original && TrayUI_WndProc_Original) {
-            if (SetPropW(taskbar, kPanelBridgeReadyProperty,
-                         reinterpret_cast<HANDLE>(1))) {
-                Trace(L"panel bridge: ready on primary taskbar %p", taskbar);
-            }
-        }
+        taskbar && taskbar == g_primaryTaskbar.load(std::memory_order_acquire) &&
+        cachedThreadId && cachedThreadId == currentThreadId) {
+        // These values were validated when this primary TrayUI context was
+        // recorded; stable WndProc messages can skip repeated window lookups.
+        PublishPanelBridgeReady(taskbar);
+        return;
+    }
+
+    if (!IsPrimaryTaskbarWindow(taskbar)) {
+        return;
+    }
+
+    DWORD pid = 0;
+    DWORD threadId = GetWindowThreadProcessId(taskbar, &pid);
+    if (pid != GetCurrentProcessId() || threadId != currentThreadId) {
         return;
     }
 
@@ -1788,6 +1807,7 @@ void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
         g_lastPrimaryHideEpoch = 0;
         g_lastCompletedPanelEpoch = 0;
         g_failedTrayUiLookupThis = nullptr;
+        g_primaryWndProcThis = nullptr;
         Trace(L"TrayUI from %s: %p, Unhide interface at %+d (slot %d), "
               L"primary context=%llu",
               source, received, bestOffset, bestSlot,
@@ -1801,13 +1821,8 @@ void RecordTrayUi(void* received, const wchar_t* source, HWND taskbar) {
         g_primaryWndProcThis = received;
     }
 
-    if (fromWndProc && !g_unloading.load(std::memory_order_acquire) &&
-        g_panelSessionClosedMessage.load(std::memory_order_acquire) &&
-        TrayUI__Hide_Original && TrayUI_WndProc_Original &&
-        !GetPropW(taskbar, kPanelBridgeReadyProperty) &&
-        SetPropW(taskbar, kPanelBridgeReadyProperty,
-                 reinterpret_cast<HANDLE>(1))) {
-        Trace(L"panel bridge: ready on primary taskbar %p", taskbar);
+    if (fromWndProc) {
+        PublishPanelBridgeReady(taskbar);
     }
 }
 
@@ -2001,15 +2016,6 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
         return HandlePanelSessionClosed(pThis, hWnd, wParam, lParam);
     }
 
-    if (message == WM_TIMER && g_pendingPanelResume.timerId &&
-        hWnd == g_pendingPanelResume.taskbar &&
-        wParam == g_pendingPanelResume.timerId) {
-        if (handled) {
-            *handled = true;
-        }
-        return CompletePanelResume(pThis, hWnd, wParam);
-    }
-
     if (message == WM_NCDESTROY && IsPrimaryTaskbarWindow(hWnd)) {
         ResetPrimaryTrayUi(hWnd, L"primary taskbar destroyed");
     }
@@ -2085,8 +2091,11 @@ bool IsFullScreenWindow(HWND hWnd, RECT const& monitorRect) {
 // taskbar getting hidden without passing through SlideWindow.
 constexpr UINT kIdlePollMs = 500;
 constexpr int kShownTicksBeforeIdle = 25;
+constexpr ULONGLONG kEdgePollMetricsWindowMs = 60000;
 UINT g_edgePollInterval = 0;
 int g_shownTicks = 0;
+ULONGLONG g_edgePollCallbacks = 0;
+ULONGLONG g_edgePollMetricsStart = 0;
 
 void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD);
 
@@ -2100,6 +2109,22 @@ void SetEdgePollInterval(UINT ms) {
 }
 
 void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    if (g_settings.traceToFile) {
+        const ULONGLONG now = GetTickCount64();
+        if (!g_edgePollMetricsStart) {
+            g_edgePollMetricsStart = now;
+        }
+        ++g_edgePollCallbacks;
+        const ULONGLONG elapsed = now - g_edgePollMetricsStart;
+        if (elapsed >= kEdgePollMetricsWindowMs) {
+            Trace(L"metrics window_ms=%llu edge_timer_callbacks=%llu",
+                  static_cast<unsigned long long>(elapsed),
+                  static_cast<unsigned long long>(g_edgePollCallbacks));
+            g_edgePollCallbacks = 0;
+            g_edgePollMetricsStart = now;
+        }
+    }
+
     HWND taskbar = g_edgeTaskbar;
     if (g_unloading.load(std::memory_order_acquire) || !IsWindow(taskbar)) {
         g_edgeRequested = false;
@@ -2577,6 +2602,7 @@ bool HookTaskbarSymbols() {
             {LR"(public: void __cdecl TrayUI::_Hide(void))"},
             &TrayUI__Hide_Original,
             TrayUI__Hide_Hook,
+            true,
         },
         {
             {LR"(public: virtual void __cdecl TrayUI::Unhide(enum TrayCommon::TrayUnhideFlags,enum TrayCommon::UnhideRequest))"},
@@ -2606,6 +2632,8 @@ bool HookTaskbarSymbols() {
 BOOL Wh_ModInit() {
     LoadSettings();
     g_unloading.store(false, std::memory_order_release);
+    g_edgePollCallbacks = 0;
+    g_edgePollMetricsStart = 0;
     g_pendingPanelResume = {};
     g_primaryWndProcThis = nullptr;
     g_failedTrayUiLookupThis = nullptr;
