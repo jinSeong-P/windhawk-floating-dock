@@ -1532,7 +1532,8 @@ void DiscoverPanelWindows() {
         const bool core = !wcscmp(cls, L"Windows.UI.Core.CoreWindow");
         const bool quick = !wcscmp(cls, L"ControlCenterWindow");
         const bool overflow = !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland");
-        const bool menu = !wcscmp(cls, L"#32768");
+        const bool menu = !wcscmp(cls, L"#32768") ||
+                          !wcscmp(cls, L"Xaml_WindowedPopupClass");
         if (!core && !quick && !overflow && !menu) continue;
         if (!PanelVisible(window)) continue;
         DWORD pid{};
@@ -1564,8 +1565,8 @@ void DiscoverPanelWindows() {
                      g_panelSession.current == PanelKind::Menu)) kind = PanelKind::Menu;
             }
         } else if (menu && pid == GetCurrentProcessId()) {
-            // Explorer owns many unrelated #32768 menus. Count only popups
-            // attached to the active panel/taskbar during a menu transition.
+            // Explorer owns both classic and XAML menus. Count only popups
+            // attached to the active panel or primary taskbar.
             const bool attachedToActiveUi =
                 PanelPopupOwnedBy(window, g_panelSession.window) ||
                 PanelPopupOwnedBy(window, g_taskbar);
@@ -1954,9 +1955,12 @@ void MarkPanelCancellation(const wchar_t* reason) {
 LRESULT CALLBACK PanelKeyboardProc(int code, WPARAM message, LPARAM data) {
     if (g_settings.traceToFile) ++g_panelCounters.keyboard;
     if (code == HC_ACTION && !g_unloading.load() &&
-        (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
-        reinterpret_cast<const KBDLLHOOKSTRUCT*>(data)->vkCode == VK_ESCAPE)
-        MarkPanelCancellation(L"Escape");
+        (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)) {
+        const DWORD key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data)->vkCode;
+        if (key == VK_ESCAPE) MarkPanelCancellation(L"Escape");
+        else if (key == VK_LWIN || key == VK_RWIN)
+            MarkPanelCancellation(L"new shortcut");
+    }
     return CallNextHookEx(nullptr, code, message, data);
 }
 
@@ -2102,7 +2106,8 @@ void CALLBACK FlyoutEventProc(HWINEVENTHOOK, DWORD event, HWND window,
     const bool quick = !wcscmp(cls, kQuickSettingsClass);
     const bool relevant = quick || !wcscmp(cls, L"Windows.UI.Core.CoreWindow") ||
         !wcscmp(cls, L"TopLevelWindowForOverflowXamlIsland") ||
-        !wcscmp(cls, L"#32768") || window == g_panelSession.window;
+        !wcscmp(cls, L"#32768") || !wcscmp(cls, L"Xaml_WindowedPopupClass") ||
+        window == g_panelSession.window;
     if (!relevant || (!g_panelCoordinatorStarted && !quick)) return;
     if (quick) g_quickSettingsDirty = window;
     if (g_panelCoordinatorStarted) g_panelEventDirty = true;
