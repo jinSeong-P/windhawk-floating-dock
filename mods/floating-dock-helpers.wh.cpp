@@ -1422,11 +1422,12 @@ struct PanelRecord {
 struct PanelSession {
     PanelKind current{}, requested{};
     HWND window{};
-    UINT_PTR epoch{};
     ULONGLONG deadline{};
     bool held{};
 };
 PanelSession g_panelSession;
+UINT_PTR g_panelRequestId{};
+UINT_PTR g_holdSessionId{};
 std::vector<PanelRecord> g_panelRegistry;
 UINT_PTR g_panelTimer{};
 UINT g_panelClosedMessage{};
@@ -1442,13 +1443,13 @@ bool g_trayClickModuleSeen{};
 struct PendingPanelActivation {
     winrt::weak_ref<FrameworkElement> button;
     HWND oldWindow{};
-    UINT_PTR epoch{};
+    UINT_PTR requestId{};
     bool released{}, closeCompleted{};
 };
 PendingPanelActivation g_pendingPanelActivation;
 
-void CALLBACK PanelCloseCompleted(HWND, UINT, ULONG_PTR epoch, LRESULT) {
-    if (!g_unloading.load() && g_pendingPanelActivation.epoch == epoch)
+void CALLBACK PanelCloseCompleted(HWND, UINT, ULONG_PTR requestId, LRESULT) {
+    if (!g_unloading.load() && g_pendingPanelActivation.requestId == requestId)
         g_pendingPanelActivation.closeCompleted = true;
 }
 
@@ -1556,14 +1557,16 @@ void SetPanelHold(bool hold) {
     }
     RemovePropW(g_taskbar, kQuickSettingsHoldProperty);
     if (hold) {
-        if (!g_panelSession.epoch) g_panelSession.epoch = 1;
-        SetPropW(g_taskbar, kPanelEpoch, reinterpret_cast<HANDLE>(g_panelSession.epoch));
-        SetPropW(g_taskbar, kPanelHold, reinterpret_cast<HANDLE>(g_panelSession.epoch));
-        g_panelSession.held = true;
+        if (!g_panelSession.held) {
+            if (!++g_holdSessionId) ++g_holdSessionId;
+            SetPropW(g_taskbar, kPanelEpoch, reinterpret_cast<HANDLE>(g_holdSessionId));
+            SetPropW(g_taskbar, kPanelHold, reinterpret_cast<HANDLE>(g_holdSessionId));
+            g_panelSession.held = true;
+        }
     } else if (g_panelSession.held) {
         RemovePropW(g_taskbar, kPanelHold);
         g_panelSession.held = false;
-        PostMessageW(g_taskbar, g_panelClosedMessage, g_panelSession.epoch, 0);
+        PostMessageW(g_taskbar, g_panelClosedMessage, g_holdSessionId, 0);
     }
 }
 
@@ -1595,18 +1598,16 @@ void ReconcilePanels() {
         g_panelSession.deadline = 0;
     } else if (g_panelSession.deadline && now >= g_panelSession.deadline) {
         Trace(L"panel transition expired epoch=%llu requested=%d actual=%d",
-              static_cast<unsigned long long>(g_panelSession.epoch),
+              static_cast<unsigned long long>(g_panelRequestId),
               static_cast<int>(g_panelSession.requested), static_cast<int>(actual));
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
     }
     if (actual != g_panelSession.current) {
         Trace(L"panel state epoch=%llu %d -> %d window=%p transition=%d",
-              static_cast<unsigned long long>(g_panelSession.epoch),
+              static_cast<unsigned long long>(g_panelRequestId),
               static_cast<int>(g_panelSession.current), static_cast<int>(actual),
               PanelWindow(actual), g_panelSession.deadline != 0);
-        if (actual != PanelKind::None && !g_panelSession.held && !g_panelSession.deadline)
-            ++g_panelSession.epoch;
     }
     g_panelSession.current = actual;
     g_panelSession.window = PanelWindow(actual);
@@ -1615,10 +1616,12 @@ void ReconcilePanels() {
     g_panelReconciling = false;
 }
 
-void RequestPanel(PanelKind target) {
+void RequestPanel(PanelKind target, FrameworkElement const& button = nullptr) {
     if (g_unloading.load() || !GetPropW(g_taskbar, kPanelReady)) return;
     ReconcilePanels();
     const PanelKind old = g_panelSession.current;
+    ++g_panelRequestId;
+    if (!g_panelRequestId) ++g_panelRequestId;
     if (target == PanelKind::TaskView) {
         // Full-screen Task View owns the native taskbar policy. This is a
         // release of our override, not a request to force-hide the taskbar.
@@ -1634,20 +1637,24 @@ void RequestPanel(PanelKind target) {
         g_panelSession.deadline = 0;
         return;
     }
-    ++g_panelSession.epoch;
-    if (!g_panelSession.epoch) ++g_panelSession.epoch;
     g_panelSession.requested = target;
     g_panelSession.deadline = GetTickCount64() + 1000;
     SetPanelHold(true);
     Trace(L"panel input epoch=%llu old=%d target=%d",
-          static_cast<unsigned long long>(g_panelSession.epoch),
+          static_cast<unsigned long long>(g_panelRequestId),
           static_cast<int>(old), static_cast<int>(target));
+    if (button && g_trayClicksHooked && g_panelKeyboardHook && g_panelMouseHook &&
+        (old == PanelKind::Start || old == PanelKind::Search) &&
+        (target == PanelKind::Quick || target == PanelKind::Notifications)) {
+        g_pendingPanelActivation = {winrt::make_weak(button), g_panelSession.window,
+                                    g_panelRequestId, false, false};
+    }
     // Only pre-close when the target's native IconView activation is safely
     // deferred. Keyboard shortcuts and unrecognized/unhooked tray buttons
     // keep their native shell behavior.
     const bool canDeferNativeActivation = g_trayClicksHooked &&
         g_panelKeyboardHook && g_panelMouseHook &&
-        g_pendingPanelActivation.epoch == g_panelSession.epoch;
+        g_pendingPanelActivation.requestId == g_panelRequestId;
     if (canDeferNativeActivation &&
         (target == PanelKind::Quick || target == PanelKind::Notifications) &&
         (old == PanelKind::Start || old == PanelKind::Search)) {
@@ -1657,10 +1664,10 @@ void RequestPanel(PanelKind target) {
         } else if (old == PanelKind::Search && PanelVisible(g_panelSession.window)) {
             // Exact Search root only; proven not to dismiss the new QS root.
             if (!SendMessageCallbackW(g_panelSession.window, WM_SYSCOMMAND,
-                                      SC_CLOSE, 0, PanelCloseCompleted, g_panelSession.epoch))
+                                      SC_CLOSE, 0, PanelCloseCompleted, g_panelRequestId))
                 g_pendingPanelActivation = {};
         }
-        if (old == PanelKind::Start && g_pendingPanelActivation.epoch == g_panelSession.epoch)
+        if (old == PanelKind::Start && g_pendingPanelActivation.requestId == g_panelRequestId)
             g_pendingPanelActivation.closeCompleted = true;
     } else if ((target == PanelKind::Quick || target == PanelKind::Notifications) &&
                (old == PanelKind::Start || old == PanelKind::Search)) {
@@ -1670,12 +1677,12 @@ void RequestPanel(PanelKind target) {
 }
 
 void CancelPendingPanelActivation(const wchar_t* reason) {
-    const UINT_PTR epoch = g_pendingPanelActivation.epoch;
+    const UINT_PTR epoch = g_pendingPanelActivation.requestId;
     if (!epoch) return;
     Trace(L"panel deferred activation canceled epoch=%llu reason=%s",
           static_cast<unsigned long long>(epoch), reason);
     g_pendingPanelActivation = {};
-    if (epoch == g_panelSession.epoch && g_panelSession.deadline) {
+    if (epoch == g_panelRequestId && g_panelSession.deadline) {
         g_panelSession.requested = PanelKind::None;
         g_panelSession.deadline = 0;
         SetPanelHold(g_panelSession.current != PanelKind::None);
@@ -1736,20 +1743,22 @@ FrameworkElement PanelInvokableButton(DependencyObject source) {
 
 void CompletePanelActivation() {
     auto pending = g_pendingPanelActivation;
-    if (!pending.epoch) return;
-    if (pending.epoch != g_panelSession.epoch || !g_panelSession.deadline ||
-        GetTickCount64() >= g_panelSession.deadline) {
+    if (!pending.requestId) return;
+    if (pending.requestId != g_panelRequestId) {
         g_pendingPanelActivation = {};
         return;
     }
-    if (!pending.released || !pending.closeCompleted || PanelVisible(pending.oldWindow)) return;
-    // Completion callback confirms the old native command returned. A weak
-    // XAML reference and epoch prevent late callbacks activating a new session.
+    const bool expired = !g_panelSession.deadline || GetTickCount64() >= g_panelSession.deadline;
+    if (!expired && (!pending.released || !pending.closeCompleted || PanelVisible(pending.oldWindow))) return;
+    // Clear before Invoke: native activation may reenter the dispatcher.
     g_pendingPanelActivation = {};
+    if (!pending.released) return;
     if (auto button = pending.button.get()) {
         try {
             if (auto invoke = PanelInvokeProvider(button)) {
-                Trace(L"panel deferred activation epoch=%llu", static_cast<unsigned long long>(pending.epoch));
+                Trace(L"panel deferred activation %s request=%llu",
+                      expired ? L"recovered" : L"completed",
+                      static_cast<unsigned long long>(pending.requestId));
                 invoke.Invoke();
             }
         } catch (winrt::hresult_error const& error) {
@@ -1764,11 +1773,11 @@ TrayClickPoint_t g_trayClickPointOriginal{};
 TrayClick_t g_trayClickOriginal{};
 
 bool DeferNativeTrayClick(bool right) {
-    if (right || g_unloading.load() || !g_pendingPanelActivation.epoch ||
-        g_pendingPanelActivation.epoch != g_panelSession.epoch ||
+    if (right || g_unloading.load() || !g_pendingPanelActivation.requestId ||
+        g_pendingPanelActivation.requestId != g_panelRequestId ||
         !OnTaskbarUiThread(g_taskbar)) return false;
     g_pendingPanelActivation.released = true;
-    Trace(L"panel native activation intercepted epoch=%llu", static_cast<unsigned long long>(g_panelSession.epoch));
+    Trace(L"panel native activation intercepted epoch=%llu", static_cast<unsigned long long>(g_panelRequestId));
     CompletePanelActivation();
     return true;
 }
@@ -1813,7 +1822,7 @@ void AttachPanelInput() {
     g_panelPointerHandler = Input::PointerEventHandler([](auto const&, Input::PointerRoutedEventArgs const& args) {
         try {
             if (g_unloading.load()) return;
-            if (g_pendingPanelActivation.epoch)
+            if (g_pendingPanelActivation.requestId)
                 CancelPendingPanelActivation(L"taskbar pointer button");
             auto root = g_panelInputRoot.get();
             if (!root) return;
@@ -1823,20 +1832,11 @@ void AttachPanelInput() {
                 target = PanelContextButton(args.OriginalSource().try_as<DependencyObject>())
                             ? PanelKind::Menu : PanelKind::None;
             if (target != PanelKind::None) {
-                ReconcilePanels();
-                const PanelKind old = g_panelSession.current;
+                FrameworkElement button{nullptr};
                 if (!point.Properties().IsRightButtonPressed() &&
-                    (old == PanelKind::Start || old == PanelKind::Search) &&
-                    (target == PanelKind::Quick || target == PanelKind::Notifications)) {
-                    auto button = PanelInvokableButton(args.OriginalSource().try_as<DependencyObject>());
-                    if (button && g_trayClicksHooked &&
-                        g_panelKeyboardHook && g_panelMouseHook) {
-                        g_pendingPanelActivation = {winrt::make_weak(button), g_panelSession.window,
-                            g_panelSession.epoch + 1, false, false};
-                        Trace(L"panel native click deferred old=%d target=%d", static_cast<int>(old), static_cast<int>(target));
-                    } else Trace(L"panel defer unavailable button=%d", button != nullptr);
-                }
-                RequestPanel(target);
+                    (target == PanelKind::Quick || target == PanelKind::Notifications))
+                    button = PanelInvokableButton(args.OriginalSource().try_as<DependencyObject>());
+                RequestPanel(target, button);
             }
         } catch (winrt::hresult_error const& error) {
             Trace(L"panel input failed 0x%08X", static_cast<unsigned>(error.code()));
@@ -1906,7 +1906,7 @@ void StartPanelCoordinator() {
     if (!g_panelClosedMessage)
         g_panelClosedMessage = RegisterWindowMessageW(L"FloatingDock.PanelSessionClosed.v1");
     if (!g_panelTimer) {
-        g_panelSession.epoch = reinterpret_cast<UINT_PTR>(GetPropW(g_taskbar, kPanelEpoch));
+        g_holdSessionId = reinterpret_cast<UINT_PTR>(GetPropW(g_taskbar, kPanelEpoch));
         g_panelTimer = SetTimer(nullptr, 0, 50, PanelTimerProc);
     }
     if (!g_trayClicksHooked && !g_trayClickModuleSeen && HookTrayClicks())
