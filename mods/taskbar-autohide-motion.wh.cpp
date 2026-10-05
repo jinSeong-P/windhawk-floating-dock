@@ -1557,6 +1557,13 @@ HWND g_edgeTaskbar = nullptr;
 UINT_PTR g_edgePollTimer = 0;
 // Set once the unhide was requested for the current visit to the edge.
 bool g_edgeRequested = false;
+// Geometry only: keep testing the current cursor, taskbar and fullscreen
+// window each tick. A stationary cursor never suppresses reveal checks.
+bool g_edgeGeometryValid = false;
+POINT g_edgeGeometryCursor{};
+RECT g_edgeGeometryTaskbar{};
+HMONITOR g_edgeGeometryMonitor{};
+MONITORINFO g_edgeGeometry{sizeof(MONITORINFO)};
 
 // Executable sections of taskbar.dll, where every vtable entry points.
 std::vector<std::pair<uintptr_t, uintptr_t>> g_taskbarCode;
@@ -2007,6 +2014,10 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
                                    bool* handled) {
     RecordTrayUi(pThis, L"WndProc", hWnd);
 
+    if (hWnd == g_edgeTaskbar &&
+        (message == WM_DISPLAYCHANGE || message == WM_SETTINGCHANGE ||
+         message == WM_DPICHANGED)) g_edgeGeometryValid = false;
+
     const UINT closeMessage =
         g_panelSessionClosedMessage.load(std::memory_order_acquire);
     if (closeMessage && message == closeMessage) {
@@ -2132,6 +2143,7 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     }
 
     if (!IsTaskbarHiddenOnScreen(taskbar)) {
+        g_edgeGeometryValid = false;
         g_edgeRequested = false;
         if (++g_shownTicks >= kShownTicksBeforeIdle) {
             SetEdgePollInterval(kIdlePollMs);
@@ -2148,13 +2160,22 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
 
     POINT pt{};
     RECT taskbarRect{};
-    MONITORINFO monitorInfo{sizeof(monitorInfo)};
-    if (!GetCursorPos(&pt) || !GetWindowRect(taskbar, &taskbarRect) ||
-        !GetMonitorInfoW(MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST),
-                         &monitorInfo)) {
+    if (!GetCursorPos(&pt) || !GetWindowRect(taskbar, &taskbarRect)) {
         return;
     }
-    RECT const& monitorRect = monitorInfo.rcMonitor;
+    const HMONITOR monitor = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+    if (!g_edgeGeometryValid || pt.x != g_edgeGeometryCursor.x ||
+        pt.y != g_edgeGeometryCursor.y || monitor != g_edgeGeometryMonitor ||
+        !EqualRect(&taskbarRect, &g_edgeGeometryTaskbar)) {
+        MONITORINFO info{sizeof(info)};
+        if (!GetMonitorInfoW(monitor, &info)) return;
+        g_edgeGeometry = info;
+        g_edgeGeometryCursor = pt;
+        g_edgeGeometryTaskbar = taskbarRect;
+        g_edgeGeometryMonitor = monitor;
+        g_edgeGeometryValid = true;
+    }
+    RECT const& monitorRect = g_edgeGeometry.rcMonitor;
 
     // Bottom taskbars only; the hidden window hangs below the monitor. Keep
     // the cursor on the monitor's final row so another monitor below cannot
@@ -2189,6 +2210,7 @@ void CALLBACK EdgePollTimerProc(HWND, UINT, UINT_PTR, DWORD) {
 
 // Must run on the taskbar UI thread; the timer fires there.
 void StartEdgePoll(HWND taskbar) {
+    g_edgeGeometryValid = false;
     if (!g_settings.revealAlongWholeEdge || !TrayUI_Unhide_Original ||
         !TrayUI_WndProc_Original) {
         return;
@@ -2215,6 +2237,7 @@ void StartEdgePoll(HWND taskbar) {
 }
 
 void StopEdgePoll() {
+    g_edgeGeometryValid = false;
     if (g_edgePollTimer) {
         KillTimer(nullptr, g_edgePollTimer);
         g_edgePollTimer = 0;
