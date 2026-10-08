@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.8 (2026-10-08)
+
+- Stop app notifications from pinning the dock. When an app flashes its
+  taskbar button, Windows kept the taskbar up until that app was activated
+  or closed. Motion now hides it after *Attention reveal duration* (3000 ms by
+  default; 0 keeps the Windows behavior). The button keeps its highlight, and
+  mouse hover and open menus still keep the dock up.
+- Give each app one reveal per notification. Apps that keep flashing repeat
+  their reveal request every 2 to 10 s; repeated requests from an app whose
+  reveal is over are dropped until it stops flashing or stays quiet for 15 s.
+  Another app's notification still gets its own reveal.
+- Hook `TrayUI::Unhide` by address so the TrayUI interface lookup used by the
+  whole-edge reveal keeps working.
+- Helpers' behavior is unchanged from 1.0.7; its version follows the pair.
+  See `docs/verification-1.0.8.txt`.
+
 ## 1.0.7 (2026-10-06)
 
 - Require an open taskbar XAML menu presenter before recognizing an owned

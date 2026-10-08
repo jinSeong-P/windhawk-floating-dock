@@ -9,7 +9,7 @@ also protects OLED displays from burn-in.
 
 ![The floating dock sliding up from the bottom edge, popping slightly as it lands, then sliding back down until nothing is left on screen](docs/reveal.gif)
 
-Current version: **1.0.7** · Windows 11 · [Changelog](CHANGELOG.md) ·
+Current version: **1.0.8** · Windows 11 · [Changelog](CHANGELOG.md) ·
 [GPL-3.0](LICENSE)
 
 ## Contents
@@ -34,6 +34,10 @@ Current version: **1.0.7** · Windows 11 · [Changelog](CHANGELOG.md) ·
   you can reveal it from anywhere along the bottom edge.
 - **Nothing left on screen.** Windows normally leaves a 1-2 px strip of the
   hidden taskbar visible. This project hides it completely.
+- **Brief notifications.** When an app asks for attention (a new message, for
+  example), Windows keeps the taskbar up until you open that app. Here the
+  dock shows for 3 seconds and hides again; the app's button stays
+  highlighted.
 - **Two layouts.** *mac*: the dock and tray sit side by side in the center.
   *left*: the dock on the left, the tray on the right.
 - **Panels that behave.** Start, Search, Quick Settings, Notifications and
@@ -152,6 +156,7 @@ Open a mod in Windhawk and choose **Settings** to change these.
 | Transparent while hidden | Hides the strip Windows leaves on screen | On |
 | Reveal delay | How long the mouse rests on the edge before the dock appears (0 = Windows default) | 0 ms |
 | Hide delay | How long after the mouse leaves before the dock hides (0 = Windows default, about 500 ms) | 300 ms |
+| Attention reveal duration | How long the dock stays up when an app flashes its button, for a new message for example. Each app gets one reveal per notification (0 = Windows behavior: up until you open that app) | 3000 ms |
 | Reveal along the whole bottom edge | Reveal from anywhere on the bottom edge, not only below the dock and tray. Never over full screen windows | On |
 | Respect Windows animation effects | If Windows animations are off, the dock appears without animating | On |
 | Diagnostic trace file | Writes a log to `%TEMP%\taskbar-autohide-motion.log` | Off |
@@ -261,10 +266,17 @@ Turn the option off afterwards.
 - While a panel is open, Helpers holds the dock and Motion postpones Windows'
   own hide request; when the last panel closes, that hide resumes. Panels are
   tracked from window events, with no periodic scan while idle.
+- Windows keeps the taskbar up while any button group reports
+  `CTaskBtnGroup::IsFlashing`, and apps that keep flashing repeat their reveal
+  request every few seconds. Motion holds each reveal request
+  (`TrayUI::Unhide`) until the flashing change that follows names the button
+  group, gives each group one reveal per burst of changes, and lets a group
+  whose reveal is over answer "not flashing" to the auto-hide check only.
 
 </details>
 
-- Verification reports: [1.0.7](docs/verification-1.0.7.txt),
+- Verification reports: [1.0.8](docs/verification-1.0.8.txt),
+  [1.0.7](docs/verification-1.0.7.txt),
   [1.0.6](docs/verification-1.0.6.txt), [1.0.5](docs/verification-1.0.5.txt)
 - Code style: [docs/code-style.txt](docs/code-style.txt) and
   [.clang-format](.clang-format)

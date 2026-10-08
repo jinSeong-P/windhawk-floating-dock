@@ -2,7 +2,7 @@
 // @id              taskbar-autohide-motion
 // @name            Taskbar Auto-Hide Motion
 // @description     Smooth slide and pop for the auto-hidden Windows 11 taskbar, invisible while hidden (OLED friendly), revealed along the whole bottom edge
-// @version         1.0.7
+// @version         1.0.8
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -38,6 +38,10 @@ Requires **Automatically hide the taskbar** to be on (Settings > Personalization
   the taskbar there. This mod reveals it anywhere along the bottom edge
   (except over full screen windows).
 - **Delays.** The reveal and hide delays of auto-hide are configurable.
+- **Short attention reveal.** When an app flashes its button (a new message,
+  for example), Windows reveals the taskbar and keeps it up until you switch
+  to that app. This mod hides it again after a few seconds; the button keeps
+  its highlight.
 - Any failure falls back to Windows' own animation.
 
 Part of [windhawk-floating-dock](https://github.com/jinSeong-P/windhawk-floating-dock),
@@ -104,6 +108,9 @@ Windhawk taskbar mods in the official ramensoftware/windhawk-mods repository.
 - hideDelayMs: 300
   $name: Hide delay in ms
   $description: Time after the mouse leaves before the taskbar hides. 0 keeps the Windows default (about 500 ms).
+- attentionRevealMs: 3000
+  $name: Attention reveal duration in ms
+  $description: How long the taskbar stays revealed when an app flashes its button, for a new message for example. The button keeps its highlight. 0 keeps the Windows behavior, which holds the taskbar up until you switch to that app.
 - revealAlongWholeEdge: true
   $name: Reveal along the whole bottom edge
   $description: With Taskbar Styler's click-through option, reveals the taskbar anywhere along the bottom edge instead of only below the dock and the tray. Never over full screen windows.
@@ -213,6 +220,7 @@ struct Settings {
     bool fadeHidden = true;
     int unhideDelayMs = 0;
     int hideDelayMs = 300;
+    int attentionRevealMs = 3000;
     bool revealAlongWholeEdge = true;
     bool respectSystemAnimations = true;
     bool traceToFile = false;
@@ -1502,6 +1510,8 @@ constexpr UINT kEdgePollMs = 40;
 // (TrayUnhideFlags 0, UnhideRequest 15), as traced on 26200.
 constexpr int kUnhideFlagsNone = 0;
 constexpr int kUnhideRequestMouse = 15;
+// The request Windows makes when a taskbar button starts flashing.
+constexpr int kUnhideRequestAttention = 17;
 
 using TrayUI_Unhide_t = void(WINAPI*)(void* pThis, int flags, int request);
 TrayUI_Unhide_t TrayUI_Unhide_Original = nullptr;
@@ -2355,6 +2365,201 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
 }
 
 // -----------------------------------------------------------------------------
+// Attention reveal. When an app flashes its taskbar button, Windows calls
+// TrayUI::Unhide (UnhideRequest 17), then reports the change to the button
+// group with CTaskBtnGroup::NotifyFlashingChange. TrayUI::_ShouldAutoHideTray
+// then keeps the taskbar up as long as any group reports
+// CTaskBtnGroup::IsFlashing, which lasts until that app is activated or
+// closed. Apps that keep flashing repeat the request and the change every 2 to
+// 10 s (as traced on 26200).
+//
+// Each group gets one reveal of attentionRevealMs per burst of changes. The
+// reveal request waits for the change that follows it, which names the group:
+// a group whose reveal is over has its repeated requests dropped, and it
+// answers "not flashing" to the auto-hide check only, so the button keeps its
+// highlight. A burst ends when the group stops flashing or reports no change
+// for kAttentionBurstGapMs. Mouse hover and open menus still keep the taskbar
+// up. Everything here runs on the taskbar UI thread.
+// -----------------------------------------------------------------------------
+
+// Largest gap between two flashing changes of one burst (10 s traced).
+constexpr ULONGLONG kAttentionBurstGapMs = 15000;
+
+using TrayUI__ShouldAutoHideTray_t = bool(WINAPI*)(void* pThis,
+                                                   void* telemetry);
+TrayUI__ShouldAutoHideTray_t TrayUI__ShouldAutoHideTray_Original = nullptr;
+
+using CTaskBtnGroup_IsFlashing_t = BOOL(WINAPI*)(void* pThis);
+CTaskBtnGroup_IsFlashing_t CTaskBtnGroup_IsFlashing_Original = nullptr;
+
+using CTaskBtnGroup_NotifyFlashingChange_t = void(WINAPI*)(void* pThis,
+                                                           void* taskItem);
+CTaskBtnGroup_NotifyFlashingChange_t
+    CTaskBtnGroup_NotifyFlashingChange_Original = nullptr;
+
+// TrayUI_Unhide_Original keeps the address of TrayUI::Unhide itself, which the
+// TrayUI interface lookup compares against vtable entries; calls made through
+// it pass through TrayUI_Unhide_Hook.
+TrayUI_Unhide_t TrayUI_Unhide_Native = nullptr;
+
+struct AttentionBurst {
+    ULONGLONG revealStart = 0;
+    ULONGLONG lastChange = 0;
+};
+
+// Button group -> its current burst.
+std::unordered_map<void*, AttentionBurst> g_attentionBursts;
+
+// A reveal request waiting for the flashing change that names its group. A
+// timer applies it if no change follows.
+struct PendingAttentionUnhide {
+    void* trayUi = nullptr;
+    int flags = 0;
+    int request = 0;
+    UINT_PTR timerId = 0;
+};
+
+thread_local PendingAttentionUnhide t_pendingAttentionUnhide;
+thread_local bool t_inShouldAutoHideTray = false;
+thread_local bool t_attentionReleased = false;
+
+bool AttentionRevealEnabled() {
+    return g_settings.attentionRevealMs > 0 && TrayUI_Unhide_Native &&
+           CTaskBtnGroup_NotifyFlashingChange_Original &&
+           CTaskBtnGroup_IsFlashing_Original &&
+           !g_unloading.load(std::memory_order_acquire);
+}
+
+bool AttentionRevealRunning(AttentionBurst const& burst, ULONGLONG now) {
+    return now - burst.revealStart <
+           static_cast<ULONGLONG>(g_settings.attentionRevealMs);
+}
+
+// Bursts without a change for longer than both the gap and the reveal are
+// over; their groups may have been destroyed since.
+void PruneAttentionBursts(ULONGLONG now) {
+    const ULONGLONG lifetime =
+        std::max(kAttentionBurstGapMs,
+                 static_cast<ULONGLONG>(g_settings.attentionRevealMs));
+    std::erase_if(g_attentionBursts, [&](auto const& entry) {
+        return now - entry.second.lastChange >= lifetime;
+    });
+}
+
+std::optional<PendingAttentionUnhide> TakePendingAttentionUnhide() {
+    PendingAttentionUnhide& pending = t_pendingAttentionUnhide;
+    if (!pending.trayUi) {
+        return std::nullopt;
+    }
+    if (pending.timerId) {
+        KillTimer(nullptr, pending.timerId);
+    }
+    PendingAttentionUnhide taken = pending;
+    pending = {};
+    return taken;
+}
+
+void ApplyPendingAttentionUnhide() {
+    if (auto pending = TakePendingAttentionUnhide()) {
+        TrayUI_Unhide_Native(pending->trayUi, pending->flags, pending->request);
+    }
+}
+
+void CALLBACK PendingAttentionUnhideTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    Trace(L"attention reveal request: no flashing change followed, applied");
+    ApplyPendingAttentionUnhide();
+}
+
+void WINAPI TrayUI_Unhide_Hook(void* pThis, int flags, int request) {
+    if (request != kUnhideRequestAttention || !AttentionRevealEnabled()) {
+        TrayUI_Unhide_Native(pThis, flags, request);
+        return;
+    }
+
+    ApplyPendingAttentionUnhide();
+    PendingAttentionUnhide& pending = t_pendingAttentionUnhide;
+    pending.trayUi = pThis;
+    pending.flags = flags;
+    pending.request = request;
+    pending.timerId = SetTimer(nullptr, 0, USER_TIMER_MINIMUM,
+                               PendingAttentionUnhideTimerProc);
+    if (!pending.timerId) {
+        ApplyPendingAttentionUnhide();
+    }
+}
+
+void WINAPI CTaskBtnGroup_NotifyFlashingChange_Hook(void* pThis,
+                                                    void* taskItem) {
+    auto pending = TakePendingAttentionUnhide();
+    if (!AttentionRevealEnabled()) {
+        if (pending) {
+            TrayUI_Unhide_Native(pending->trayUi, pending->flags,
+                                 pending->request);
+        }
+        CTaskBtnGroup_NotifyFlashingChange_Original(pThis, taskItem);
+        return;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    PruneAttentionBursts(now);
+    auto [it, newBurst] = g_attentionBursts.try_emplace(pThis);
+    AttentionBurst& burst = it->second;
+    if (newBurst) {
+        burst.revealStart = now;
+    }
+    burst.lastChange = now;
+
+    if (pending) {
+        if (AttentionRevealRunning(burst, now)) {
+            Trace(L"attention reveal for group %p: %s", pThis,
+                  newBurst ? L"starts" : L"running");
+            TrayUI_Unhide_Native(pending->trayUi, pending->flags,
+                                 pending->request);
+        } else {
+            Trace(L"attention reveal request dropped: group %p already "
+                  L"revealed in this burst",
+                  pThis);
+        }
+    }
+
+    CTaskBtnGroup_NotifyFlashingChange_Original(pThis, taskItem);
+
+    // A group that stopped flashing starts a new burst with its next flash.
+    if (!CTaskBtnGroup_IsFlashing_Original(pThis)) {
+        g_attentionBursts.erase(pThis);
+    }
+}
+
+BOOL WINAPI CTaskBtnGroup_IsFlashing_Hook(void* pThis) {
+    const BOOL flashing = CTaskBtnGroup_IsFlashing_Original(pThis);
+    if (!flashing || !t_inShouldAutoHideTray || !AttentionRevealEnabled()) {
+        return flashing;
+    }
+
+    // A group without a burst has been flashing since before the mod loaded
+    // or for longer than a burst lasts.
+    auto it = g_attentionBursts.find(pThis);
+    if (it != g_attentionBursts.end() &&
+        AttentionRevealRunning(it->second, GetTickCount64())) {
+        return flashing;
+    }
+    t_attentionReleased = true;
+    return FALSE;
+}
+
+bool WINAPI TrayUI__ShouldAutoHideTray_Hook(void* pThis, void* telemetry) {
+    t_inShouldAutoHideTray = true;
+    t_attentionReleased = false;
+    const bool shouldHide =
+        TrayUI__ShouldAutoHideTray_Original(pThis, telemetry);
+    t_inShouldAutoHideTray = false;
+    if (shouldHide && t_attentionReleased) {
+        Trace(L"attention reveal over: hide while a button flashes");
+    }
+    return shouldHide;
+}
+
+// -----------------------------------------------------------------------------
 // Auto-hide delays.
 // -----------------------------------------------------------------------------
 
@@ -2488,6 +2693,9 @@ void WINAPI ApplyInitialStateOnUiThread(PVOID parameter) {
 void WINAPI CleanupTaskbarOnUiThread(PVOID parameter) {
     HWND hWnd = reinterpret_cast<HWND>(parameter);
 
+    // Its timer would outlive the mod.
+    ApplyPendingAttentionUnhide();
+
     if (IsPrimaryTaskbarWindow(hWnd)) {
         ResetPrimaryTrayUi(hWnd, L"mod unload");
         RemovePropW(hWnd, kPanelBridgeReadyProperty);
@@ -2571,6 +2779,8 @@ void LoadSettings() {
         std::clamp(Wh_GetIntSetting(L"unhideDelayMs"), 0, 2000);
     g_settings.hideDelayMs =
         std::clamp(Wh_GetIntSetting(L"hideDelayMs"), 0, 5000);
+    g_settings.attentionRevealMs =
+        std::clamp(Wh_GetIntSetting(L"attentionRevealMs"), 0, 60000);
     g_settings.revealAlongWholeEdge =
         Wh_GetIntSetting(L"revealAlongWholeEdge") != 0;
     g_settings.respectSystemAnimations =
@@ -2639,11 +2849,39 @@ bool HookTaskbarSymbols() {
             TrayUI_WndProc_Hook,
             true,
         },
+        {
+            {LR"(public: bool __cdecl TrayUI::_ShouldAutoHideTray(class AutoHideTelemetry::TaskbarAutoHideTelemetry::AutoHideOnTaskbarHide))"},
+            &TrayUI__ShouldAutoHideTray_Original,
+            TrayUI__ShouldAutoHideTray_Hook,
+            true,
+        },
+        {
+            {LR"(public: virtual int __cdecl CTaskBtnGroup::IsFlashing(void))"},
+            &CTaskBtnGroup_IsFlashing_Original,
+            CTaskBtnGroup_IsFlashing_Hook,
+            true,
+        },
+        {
+            {LR"(public: virtual void __cdecl CTaskBtnGroup::NotifyFlashingChange(struct ITaskItem *))"},
+            &CTaskBtnGroup_NotifyFlashingChange_Original,
+            CTaskBtnGroup_NotifyFlashingChange_Hook,
+            true,
+        },
     };
 
     if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
         Wh_Log(L"taskbar.dll symbol hook failed");
         return false;
+    }
+
+    // Hooked by address so that TrayUI_Unhide_Original stays the function's
+    // own address.
+    if (TrayUI_Unhide_Original &&
+        !WindhawkUtils::SetFunctionHook(TrayUI_Unhide_Original,
+                                        TrayUI_Unhide_Hook,
+                                        &TrayUI_Unhide_Native)) {
+        Wh_Log(L"TrayUI::Unhide hook failed");
+        TrayUI_Unhide_Native = nullptr;
     }
 
     return true;

@@ -2,7 +2,7 @@
 // @id              floating-dock-helpers
 // @name            Floating Dock Helpers
 // @description     macOS-style layout for a floating Windows 11 taskbar (tray next to the centered dock), hot corners for Start and Show desktop, Quick Settings that follows the tray
-// @version         1.0.7
+// @version         1.0.8
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock

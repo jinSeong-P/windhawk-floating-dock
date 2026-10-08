@@ -1,0 +1,61 @@
+Floating Dock 1.0.8 focused verification
+Date: 2026-10-08
+Baseline: 1.0.7, ab5a8d7
+Environment: Windows build 26200; primary bottom taskbar, 2880 x 1800 at 175%
+(laptop). Settings as shipped, Hide delay 120 ms.
+
+Reported problem
+After an app notification (a messenger with an unread chat, a window asking for
+attention) the auto-hidden dock came up and stayed up.
+
+Root cause
+Reproduced with a minimized window that is never activated and calls
+FlashWindowEx(FLASHW_TRAY | FLASHW_TIMERNOFG). The same result with both dock
+mods disabled: the taskbar stays up after FLASHW_STOP and hides only when the
+window is closed. This is Windows behavior, not a regression in the mods.
+Traced on 26200:
+- Windows calls TrayUI::Unhide(flags 0, UnhideRequest 17), then
+  CTaskBtnGroup::NotifyFlashingChange on the button group, in that order and
+  on the taskbar UI thread, in every traced case.
+- While shown, the hide timer polls TrayUI::_ShouldAutoHideTray, which calls
+  CTaskBtnGroup::IsFlashing on every group and returns false while any group
+  reports flashing, until the app is activated or closed.
+- FLASHW_ALL | FLASHW_TIMERNOFG repeats the request and the change every 2 to
+  10 s for as long as the window flashes. One FLASHW_TRAY flash produced up to
+  three changes within about 8 s.
+
+Implementation
+- IsFlashing answers false inside _ShouldAutoHideTray only, for a group whose
+  reveal has lasted attentionRevealMs (default 3000) or that has no tracked
+  burst. The button keeps its highlight; hover still keeps the dock up.
+- The Unhide 17 request is held until the following NotifyFlashingChange names
+  its group (a 10 ms timer applies it if no change follows). Each group gets
+  one reveal per burst; later requests in the burst are dropped once the
+  reveal is over. A burst ends when the group stops flashing or after 15 s
+  without a change.
+- Unhide is hooked by address (WindhawkUtils::SetFunctionHook) after symbol
+  resolution, so TrayUI_Unhide_Original stays the real function address that
+  the TrayUI interface lookup compares against vtable entries.
+- attentionRevealMs 0, or a missing symbol, keeps the Windows behavior.
+
+Checks (laptop, final build with tracing)
+1. One flash: shown 3.0-3.2 s, then hidden. FLASHW_STOP and closing the window
+   cause no further reveal.
+2. App P flashing continuously (FLASHW_ALL | FLASHW_TIMERNOFG): one reveal of
+   3.1 s; its later changes cause no reveal for 15 s.
+3. App Q (another process, another group) flashing while P still flashes:
+   its own 3.1 s reveal; its three repeated requests were dropped.
+4. P flashes again 33 s later, after its burst ended: a new 3.0 s reveal.
+5. P closed while Q still flashes: the dock stays hidden.
+6. Flash, then the cursor moves onto the shown dock: the dock stays up for
+   5.2 s of hover, past the 3 s reveal, and hides once the cursor leaves.
+7. Mouse reveal and 6 s hover without any flash: stays up, hides on leave.
+8. Whole-edge reveal at x=300, outside the click-through region: revealed;
+   trace shows "Unhide interface at +8 (slot 30)". Hot corner hit tests unchanged.
+
+Not covered
+- Real messenger apps were not scripted; the flash flags they use may differ.
+- Secondary monitors (CSecondaryTray) are unchanged and keep Windows behavior.
+- An earlier test once saw the dock hide while a cursor placed by
+  SetCursorPos before the reveal rested on it; it did not reproduce with the
+  final build, and real mouse movement over the dock keeps it up (check 6).

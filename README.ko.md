@@ -9,7 +9,7 @@ OLED 화면의 번인 걱정도 덜 수 있습니다.
 
 ![떠 있는 독이 화면 아래 끝에서 올라와 살짝 튀어 오르며 자리를 잡은 뒤, 다시 내려가 화면에 아무것도 남지 않는 모습](docs/reveal.gif)
 
-현재 버전: **1.0.7** · Windows 11 · [변경 기록](CHANGELOG.md) ·
+현재 버전: **1.0.8** · Windows 11 · [변경 기록](CHANGELOG.md) ·
 [GPL-3.0](LICENSE)
 
 ## 목차
@@ -33,6 +33,9 @@ OLED 화면의 번인 걱정도 덜 수 있습니다.
   화면 아래 끝 어디에서나 불러낼 수 있습니다.
 - **흔적 없는 숨김.** Windows는 숨긴 작업 표시줄을 1-2 px 정도 화면에 남기지만,
   이 프로젝트는 완전히 감춥니다.
+- **잠깐만 보이는 알림.** 앱이 주의를 요청하면(새 메시지 등) Windows는 그 앱을
+  열 때까지 작업 표시줄을 띄워 둡니다. 이 프로젝트에서는 독이 3초 동안 보였다가
+  다시 숨고, 앱 버튼의 강조 표시는 그대로 남습니다.
 - **두 가지 배치.** *mac*: 독과 트레이를 나란히 붙여 가운데에 둡니다.
   *left*: 독은 왼쪽, 트레이는 오른쪽 끝에 둡니다.
 - **깔끔한 패널 전환.** 시작·검색·빠른 설정·알림·숨김 아이콘 패널이 한 번의
@@ -145,6 +148,7 @@ Windhawk에서 모드를 열고 **설정**(Settings)을 누르면 바꿀 수 있
 | Transparent while hidden | Windows가 화면에 남기는 줄을 감춤 | 켬 |
 | Reveal delay | 마우스가 가장자리에 머문 뒤 독이 나타나기까지의 시간(0 = Windows 기본값) | 0 ms |
 | Hide delay | 마우스가 떠난 뒤 독이 숨기까지의 시간(0 = Windows 기본값, 약 500 ms) | 300 ms |
+| Attention reveal duration | 앱이 버튼을 깜빡일 때(새 메시지 등) 독이 떠 있는 시간. 앱마다 알림 한 번에 한 번만 나타남(0 = Windows 동작: 그 앱을 열 때까지 떠 있음) | 3000 ms |
 | Reveal along the whole bottom edge | 독과 트레이 아래뿐 아니라 아래 가장자리 어디서나 나타남. 전체 화면 창 위에서는 나타나지 않음 | 켬 |
 | Respect Windows animation effects | Windows 애니메이션 효과가 꺼져 있으면 애니메이션 없이 나타남 | 켬 |
 | Diagnostic trace file | `%TEMP%\taskbar-autohide-motion.log`에 기록을 남김 | 끔 |
@@ -249,10 +253,17 @@ Windhawk에서 모드를 열고 **설정**(Settings)을 누르면 바꿀 수 있
 - 패널이 열려 있는 동안 Helpers가 독을 고정하고, Motion은 Windows의 숨김 요청을
   미뤄 둡니다. 마지막 패널이 닫히면 그 숨김을 이어서 실행합니다. 패널은 창 이벤트로
   추적하며, 쓰지 않을 때는 주기적으로 검색하지 않습니다.
+- Windows는 버튼 그룹 중 하나라도 `CTaskBtnGroup::IsFlashing`을 보고하면 작업
+  표시줄을 띄워 두고, 계속 깜빡이는 앱은 몇 초마다 나타나기 요청을 반복합니다.
+  Motion은 나타나기 요청(`TrayUI::Unhide`)을 뒤따르는 깜빡임 변경 알림이 버튼
+  그룹을 알려 줄 때까지 보류하고, 그룹마다 변경 묶음 한 번에 한 번만 나타나게
+  하며, 나타나기가 끝난 그룹은 자동 숨김 판단에서만 "깜빡이지 않음"으로 답하게
+  합니다.
 
 </details>
 
-- 검증 보고서(영문): [1.0.7](docs/verification-1.0.7.txt),
+- 검증 보고서(영문): [1.0.8](docs/verification-1.0.8.txt),
+  [1.0.7](docs/verification-1.0.7.txt),
   [1.0.6](docs/verification-1.0.6.txt), [1.0.5](docs/verification-1.0.5.txt)
 - 코드 스타일: [docs/code-style.txt](docs/code-style.txt),
   [.clang-format](.clang-format)
