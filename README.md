@@ -9,7 +9,7 @@ also protects OLED displays from burn-in.
 
 ![The floating dock sliding up from the bottom edge, popping slightly as it lands, then sliding back down until nothing is left on screen](docs/reveal.gif)
 
-Current version: **1.0.8** · Windows 11 · [Changelog](CHANGELOG.md) ·
+Current version: **1.0.9** · Windows 11 · [Changelog](CHANGELOG.md) ·
 [GPL-3.0](LICENSE)
 
 ## Contents
@@ -193,6 +193,18 @@ Open a mod in Windhawk and choose **Settings** to change these.
 </details>
 
 <details>
+<summary><strong>The animation or the layout is gone after a Windows update</strong></summary>
+
+- A Windows update can replace the taskbar files, and Windhawk then downloads
+  their symbols again. If that fails at sign-in (no network yet), the mods
+  wait and retry by themselves: after 10 s, 30 s and 60 s, then every 2
+  minutes for about two hours. The dock returns once the download succeeds.
+- If it doesn't come back, turn both mods off and on in Windhawk, or restart
+  Explorer.
+
+</details>
+
+<details>
 <summary><strong>The dock and tray are misplaced or overlap</strong></summary>
 
 - The Styler preset and the *Tray next to the dock* setting must match the
@@ -275,7 +287,8 @@ Turn the option off afterwards.
 
 </details>
 
-- Verification reports: [1.0.8](docs/verification-1.0.8.txt),
+- Verification reports: [1.0.9](docs/verification-1.0.9.txt),
+  [1.0.8](docs/verification-1.0.8.txt),
   [1.0.7](docs/verification-1.0.7.txt),
   [1.0.6](docs/verification-1.0.6.txt), [1.0.5](docs/verification-1.0.5.txt)
 - Code style: [docs/code-style.txt](docs/code-style.txt) and

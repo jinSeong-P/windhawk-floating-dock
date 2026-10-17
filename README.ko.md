@@ -9,7 +9,7 @@ OLED 화면의 번인 걱정도 덜 수 있습니다.
 
 ![떠 있는 독이 화면 아래 끝에서 올라와 살짝 튀어 오르며 자리를 잡은 뒤, 다시 내려가 화면에 아무것도 남지 않는 모습](docs/reveal.gif)
 
-현재 버전: **1.0.8** · Windows 11 · [변경 기록](CHANGELOG.md) ·
+현재 버전: **1.0.9** · Windows 11 · [변경 기록](CHANGELOG.md) ·
 [GPL-3.0](LICENSE)
 
 ## 목차
@@ -185,6 +185,18 @@ Windhawk에서 모드를 열고 **설정**(Settings)을 누르면 바꿀 수 있
 </details>
 
 <details>
+<summary><strong>Windows 업데이트 후 애니메이션이나 배치가 사라졌어요</strong></summary>
+
+- Windows 업데이트로 작업 표시줄 파일이 바뀌면 Windhawk가 심볼을 다시 내려받아야
+  합니다. 로그인 직후(네트워크 연결 전) 이 다운로드에 실패하면 모드가 스스로
+  기다렸다가 다시 시도합니다: 10초, 30초, 60초 뒤, 그다음 약 2시간 동안 2분마다.
+  다운로드에 성공하면 독이 돌아옵니다.
+- 그래도 돌아오지 않으면 Windhawk에서 두 모드를 껐다 켜거나 탐색기를 다시
+  시작합니다.
+
+</details>
+
+<details>
 <summary><strong>독과 트레이 위치가 어긋나거나 겹쳐요</strong></summary>
 
 - Styler 프리셋과 *Tray next to the dock* 설정이 같은 배치여야 합니다
@@ -262,7 +274,8 @@ Windhawk에서 모드를 열고 **설정**(Settings)을 누르면 바꿀 수 있
 
 </details>
 
-- 검증 보고서(영문): [1.0.8](docs/verification-1.0.8.txt),
+- 검증 보고서(영문): [1.0.9](docs/verification-1.0.9.txt),
+  [1.0.8](docs/verification-1.0.8.txt),
   [1.0.7](docs/verification-1.0.7.txt),
   [1.0.6](docs/verification-1.0.6.txt), [1.0.5](docs/verification-1.0.5.txt)
 - 코드 스타일: [docs/code-style.txt](docs/code-style.txt),

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.9 (2026-10-17)
+
+- Recover by themselves after a Windows update. A new taskbar.dll needs new
+  symbols; when Windhawk could not download them at sign-in (no network
+  yet), both mods failed to initialize and stayed off until reloaded, so the
+  dock lost its animation and layout. Now a mod that resolves no symbol at
+  all stays loaded and retries in a background thread after 10 s, 30 s and
+  60 s, then every 2 minutes for about two hours. Once the symbols resolve it
+  applies its hooks and the dock's initial state. A partial lookup failure,
+  which means an incompatible build, still fails initialization as before.
+- Helpers also retries the SystemTray.dll lookup for one-click panel
+  switching when it failed, instead of giving up until the next reload.
+- Unloading while a retry is pending stops the thread before cleanup.
+  See `docs/verification-1.0.9.txt`.
+
 ## 1.0.8 (2026-10-08)
 
 - Stop app notifications from pinning the dock. When an app flashes its

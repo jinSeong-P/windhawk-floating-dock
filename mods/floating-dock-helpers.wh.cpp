@@ -2,7 +2,7 @@
 // @id              floating-dock-helpers
 // @name            Floating Dock Helpers
 // @description     macOS-style layout for a floating Windows 11 taskbar (tray next to the centered dock), hot corners for Start and Show desktop, Quick Settings that follows the tray
-// @version         1.0.8
+// @version         1.0.9
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -46,6 +46,9 @@ repository, together with the *Taskbar Auto-Hide Motion* mod.
 
 ## Notes
 
+- After a Windows update, if the new taskbar symbols can't be downloaded yet
+  (no network at sign-in), the mod waits and retries for about two hours
+  instead of staying off until it is reloaded.
 - The dock and the tray are moved with a RenderTransform, because Taskbar
   Styler re-applies the margin and alignment it styles. The click-through
   region is brought up to date once the moved parts have been rendered.
@@ -1470,8 +1473,14 @@ struct PanelCounters {
 
 PanelCounters g_panelCounters;
 bool g_panelReconciling = false;
-bool g_trayClicksHooked = false;
-bool g_trayClickModuleSeen = false;
+// Written by the symbol retry thread as well as the taskbar UI thread.
+std::atomic<bool> g_trayClicksHooked{false};
+std::atomic<bool> g_trayClickModuleSeen{false};
+// The SystemTray.dll symbols could not be resolved; the symbol retry thread
+// tries again. The UI thread no longer looks them up once the module is seen.
+std::atomic<bool> g_trayClickLookupFailed{false};
+
+void EnsureSymbolRetry();
 
 struct PendingPanelActivation {
     winrt::weak_ref<FrameworkElement> button;
@@ -2102,6 +2111,8 @@ bool HookTrayClicks() {
         module,
         L"?OnClicked@IconView@implementation@SystemTray@winrt@@QEAA_N_N0@Z");
     if (!point || !click) {
+        g_trayClickLookupFailed = true;
+        EnsureSymbolRetry();
         return false;
     }
     if (!Wh_SetFunctionHook(
@@ -2114,6 +2125,7 @@ bool HookTrayClicks() {
         return false;
     }
     g_trayClicksHooked = true;
+    g_trayClickLookupFailed = false;
     Trace(L"panel native tray activation hooks registered");
     return true;
 }
@@ -2737,12 +2749,20 @@ void LoadSettings() {
     g_settings.traceToFile = Wh_GetIntSetting(L"traceToFile") != 0;
 }
 
-bool HookTaskbarSymbols() {
+enum class SymbolHookResult {
+    Hooked,
+    // No symbol could be resolved, typically because the symbols of an updated
+    // taskbar.dll couldn't be downloaded yet. Nothing has been hooked.
+    Unavailable,
+    Failed,
+};
+
+SymbolHookResult HookTaskbarSymbols() {
     HMODULE module =
         LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
         Wh_Log(L"couldn't load taskbar.dll");
-        return false;
+        return SymbolHookResult::Failed;
     }
 
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
@@ -2771,11 +2791,154 @@ bool HookTaskbarSymbols() {
     };
 
     if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        const void* resolved[] = {
+            CTaskBand_ITaskListWndSite_vftable,
+            reinterpret_cast<const void*>(CTaskBand_GetTaskbarHost_Original),
+            reinterpret_cast<const void*>(TaskbarHost_FrameHeight_Original),
+            reinterpret_cast<const void*>(std__Ref_count_base__Decref_Original),
+            reinterpret_cast<const void*>(TrayUI_SlideWindow_Original),
+        };
+        if (std::ranges::all_of(resolved, [](const void* p) {
+                return !p;
+            })) {
+            Wh_Log(L"taskbar.dll symbols unavailable");
+            return SymbolHookResult::Unavailable;
+        }
         Wh_Log(L"taskbar.dll symbol hook failed");
-        return false;
+        return SymbolHookResult::Failed;
     }
 
-    return true;
+    return SymbolHookResult::Hooked;
+}
+
+// -----------------------------------------------------------------------------
+// Symbol retry. A Windows update can replace taskbar.dll or SystemTray.dll,
+// whose symbols Windhawk must then download. When that fails at sign-in,
+// typically before the network is up, Windhawk doesn't retry a mod whose init
+// failed, and the tray click lookup wasn't repeated either. A background
+// thread retries both: the taskbar symbols when none could be resolved, then
+// starts the dock; the tray click hooks when their lookup failed.
+// -----------------------------------------------------------------------------
+
+constexpr DWORD kSymbolRetryDelaysMs[] = {10000, 30000, 60000};
+constexpr DWORD kSymbolRetryIntervalMs = 120000;
+// About two hours of retries in total.
+constexpr int kSymbolRetryMaxAttempts = 62;
+
+std::atomic<bool> g_symbolsHooked{false};
+std::atomic<bool> g_taskbarSymbolsPending{false};
+std::mutex g_symbolRetryMutex;
+HANDLE g_symbolRetryStop = nullptr;
+HANDLE g_symbolRetryThread = nullptr;
+
+bool StopRequested(HANDLE stop) {
+    return WaitForSingleObject(stop, 0) != WAIT_TIMEOUT;
+}
+
+// Returns true while something still needs a retry.
+bool RetrySymbolsOnce(HANDLE stop, int attempt) {
+    if (g_taskbarSymbolsPending) {
+        const SymbolHookResult result = HookTaskbarSymbols();
+        if (result == SymbolHookResult::Failed) {
+            Trace(L"symbol retry %d: taskbar hooks failed, staying inactive",
+                  attempt);
+            g_taskbarSymbolsPending = false;
+        } else if (result == SymbolHookResult::Hooked) {
+            // Hooks registered while the mod unloads are discarded with it.
+            if (StopRequested(stop)) {
+                return false;
+            }
+            Wh_ApplyHookOperations();
+            g_taskbarSymbolsPending = false;
+            g_symbolsHooked = true;
+            Trace(L"symbol retry %d: taskbar hooked", attempt);
+            if (HWND taskbar = FindPrimaryTaskbar()) {
+                RunFromWindowThread(GetTaskbarDispatchWindow(taskbar),
+                                    StartOnUiThread, taskbar);
+            }
+        }
+    }
+
+    if (g_trayClickLookupFailed && !g_trayClicksHooked) {
+        if (HookTrayClicks()) {
+            if (StopRequested(stop)) {
+                return false;
+            }
+            Wh_ApplyHookOperations();
+            Trace(L"symbol retry %d: tray clicks hooked", attempt);
+        }
+    }
+
+    return g_taskbarSymbolsPending ||
+           (g_trayClickLookupFailed && !g_trayClicksHooked);
+}
+
+DWORD WINAPI SymbolRetryThread(LPVOID parameter) {
+    HANDLE stop = parameter;
+    for (int attempt = 1; attempt <= kSymbolRetryMaxAttempts; attempt++) {
+        const DWORD delayMs =
+            attempt <= static_cast<int>(std::size(kSymbolRetryDelaysMs))
+                ? kSymbolRetryDelaysMs[attempt - 1]
+                : kSymbolRetryIntervalMs;
+        if (WaitForSingleObject(stop, delayMs) != WAIT_TIMEOUT) {
+            return 0;
+        }
+        if (!RetrySymbolsOnce(stop, attempt)) {
+            return 0;
+        }
+        Trace(L"symbol retry %d: still unavailable", attempt);
+    }
+    Trace(L"symbol retry: giving up");
+    return 0;
+}
+
+// Starts the retry thread unless it is already running. Called from init and
+// from the UI thread after a failed tray click lookup.
+void EnsureSymbolRetry() {
+    std::lock_guard guard(g_symbolRetryMutex);
+    if (g_unloading.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (g_symbolRetryThread) {
+        if (WaitForSingleObject(g_symbolRetryThread, 0) == WAIT_TIMEOUT) {
+            return;
+        }
+        CloseHandle(g_symbolRetryThread);
+        g_symbolRetryThread = nullptr;
+    }
+    if (!g_symbolRetryStop) {
+        g_symbolRetryStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!g_symbolRetryStop) {
+            return;
+        }
+    }
+    g_symbolRetryThread = CreateThread(nullptr, 0, SymbolRetryThread,
+                                       g_symbolRetryStop, 0, nullptr);
+    if (g_symbolRetryThread) {
+        Trace(L"symbols unavailable, retrying in the background");
+    }
+}
+
+void StopSymbolRetry() {
+    HANDLE thread = nullptr;
+    HANDLE stop = nullptr;
+    {
+        std::lock_guard guard(g_symbolRetryMutex);
+        thread = std::exchange(g_symbolRetryThread, nullptr);
+        stop = std::exchange(g_symbolRetryStop, nullptr);
+        if (stop) {
+            SetEvent(stop);
+        }
+    }
+    // Joined outside the lock: the thread may be waiting on the UI thread,
+    // which may be waiting for the lock.
+    if (thread) {
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+    }
+    if (stop) {
+        CloseHandle(stop);
+    }
 }
 
 }  // namespace
@@ -2863,13 +3026,20 @@ BOOL Wh_ModInit() {
     // have been removed by the engine, so registration flags must be reset.
     g_trayClicksHooked = false;
     g_trayClickModuleSeen = false;
+    g_trayClickLookupFailed = false;
     g_alignmentApplied = false;
     g_panelCounters = {};
 
     Trace(L"v" WH_MOD_VERSION L" init");
 
-    if (!HookTaskbarSymbols()) {
+    const SymbolHookResult symbols = HookTaskbarSymbols();
+    if (symbols == SymbolHookResult::Failed) {
         return FALSE;
+    }
+    g_symbolsHooked = symbols == SymbolHookResult::Hooked;
+    g_taskbarSymbolsPending = symbols == SymbolHookResult::Unavailable;
+    if (g_taskbarSymbolsPending) {
+        EnsureSymbolRetry();
     }
     if (!HookTrayClicks()) {
         Trace(L"panel native tray activation hooks unavailable at init");
@@ -2881,6 +3051,9 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     if (QsPanelEscape::detail::IsShellHostProcess()) {
         QsHostLoader::Activate();
+        return;
+    }
+    if (!g_symbolsHooked) {
         return;
     }
     if (HWND taskbar = FindPrimaryTaskbar()) {
@@ -2895,6 +3068,11 @@ void Wh_ModBeforeUninit() {
         return;
     }
     g_unloading.store(true, std::memory_order_release);
+    StopSymbolRetry();
+    if (!g_symbolsHooked) {
+        Trace(L"cleanup complete");
+        return;
+    }
     if (HWND taskbar = g_taskbar ? g_taskbar : FindPrimaryTaskbar()) {
         RunFromWindowThread(GetTaskbarDispatchWindow(taskbar),
                             CleanupOnUiThread, nullptr);

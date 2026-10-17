@@ -2,7 +2,7 @@
 // @id              taskbar-autohide-motion
 // @name            Taskbar Auto-Hide Motion
 // @description     Smooth slide and pop for the auto-hidden Windows 11 taskbar, invisible while hidden (OLED friendly), revealed along the whole bottom edge
-// @version         1.0.8
+// @version         1.0.9
 // @author          jinSeong-P
 // @github          https://github.com/jinSeong-P
 // @homepage        https://github.com/jinSeong-P/windhawk-floating-dock
@@ -64,6 +64,9 @@ floating, macOS-style dock.
 
 ## Notes
 
+- After a Windows update, if the new taskbar symbols can't be downloaded yet
+  (no network at sign-in), the mod waits and retries for about two hours
+  instead of staying off until it is reloaded.
 - If Windows' animation effects are off, the taskbar snaps (configurable).
 - *Diagnostic trace file* writes every decision to
   `%TEMP%\taskbar-autohide-motion.log` for bug reports.
@@ -1580,6 +1583,8 @@ void RecordTaskbarImage(HMODULE module) {
     g_taskbarImageBegin = reinterpret_cast<uintptr_t>(base);
     g_taskbarImageEnd = g_taskbarImageBegin + nt->OptionalHeader.SizeOfImage;
 
+    // Called again by each symbol retry.
+    g_taskbarCode.clear();
     const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, section++) {
         if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
@@ -2788,12 +2793,20 @@ void LoadSettings() {
     g_settings.traceToFile = Wh_GetIntSetting(L"traceToFile") != 0;
 }
 
-bool HookTaskbarSymbols() {
+enum class SymbolHookResult {
+    Hooked,
+    // No symbol could be resolved, typically because the symbols of an updated
+    // taskbar.dll couldn't be downloaded yet. Nothing has been hooked.
+    Unavailable,
+    Failed,
+};
+
+SymbolHookResult HookTaskbarSymbols() {
     HMODULE module =
         LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
         Wh_Log(L"couldn't load taskbar.dll");
-        return false;
+        return SymbolHookResult::Failed;
     }
     RecordTaskbarImage(module);
 
@@ -2870,8 +2883,31 @@ bool HookTaskbarSymbols() {
     };
 
     if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        const void* resolved[] = {
+            CTaskBand_ITaskListWndSite_vftable,
+            CSecondaryTaskBand_ITaskListWndSite_vftable,
+            reinterpret_cast<const void*>(CTaskBand_GetTaskbarHost_Original),
+            TaskbarHost_FrameHeight_Original,
+            reinterpret_cast<const void*>(
+                CSecondaryTaskBand_GetTaskbarHost_Original),
+            reinterpret_cast<const void*>(std__Ref_count_base__Decref_Original),
+            reinterpret_cast<const void*>(TrayUI_SlideWindow_Original),
+            reinterpret_cast<const void*>(TrayUI__Hide_Original),
+            reinterpret_cast<const void*>(TrayUI_Unhide_Original),
+            reinterpret_cast<const void*>(TrayUI_WndProc_Original),
+            reinterpret_cast<const void*>(TrayUI__ShouldAutoHideTray_Original),
+            reinterpret_cast<const void*>(CTaskBtnGroup_IsFlashing_Original),
+            reinterpret_cast<const void*>(
+                CTaskBtnGroup_NotifyFlashingChange_Original),
+        };
+        if (std::ranges::all_of(resolved, [](const void* p) {
+                return !p;
+            })) {
+            Wh_Log(L"taskbar.dll symbols unavailable");
+            return SymbolHookResult::Unavailable;
+        }
         Wh_Log(L"taskbar.dll symbol hook failed");
-        return false;
+        return SymbolHookResult::Failed;
     }
 
     // Hooked by address so that TrayUI_Unhide_Original stays the function's
@@ -2884,7 +2920,87 @@ bool HookTaskbarSymbols() {
         TrayUI_Unhide_Native = nullptr;
     }
 
+    return SymbolHookResult::Hooked;
+}
+
+// -----------------------------------------------------------------------------
+// Symbol retry. A Windows update can replace taskbar.dll, whose symbols
+// Windhawk must then download. When that fails at sign-in, typically before
+// the network is up, Windhawk doesn't retry a mod whose init failed, so the
+// taskbar kept Windows' own animation until the mod was reloaded. When no
+// symbol could be resolved, the mod stays loaded without hooks and retries in
+// the background, then applies its hooks and the initial state.
+// -----------------------------------------------------------------------------
+
+constexpr DWORD kSymbolRetryDelaysMs[] = {10000, 30000, 60000};
+constexpr DWORD kSymbolRetryIntervalMs = 120000;
+// About two hours of retries in total.
+constexpr int kSymbolRetryMaxAttempts = 62;
+
+std::atomic<bool> g_symbolsHooked{false};
+HANDLE g_symbolRetryStop = nullptr;
+HANDLE g_symbolRetryThread = nullptr;
+
+DWORD WINAPI SymbolRetryThread(LPVOID) {
+    for (int attempt = 1; attempt <= kSymbolRetryMaxAttempts; attempt++) {
+        const DWORD delayMs =
+            attempt <= static_cast<int>(std::size(kSymbolRetryDelaysMs))
+                ? kSymbolRetryDelaysMs[attempt - 1]
+                : kSymbolRetryIntervalMs;
+        if (WaitForSingleObject(g_symbolRetryStop, delayMs) != WAIT_TIMEOUT) {
+            return 0;
+        }
+
+        const SymbolHookResult result = HookTaskbarSymbols();
+        if (result == SymbolHookResult::Unavailable) {
+            Trace(L"symbol retry %d: still unavailable", attempt);
+            continue;
+        }
+        if (result == SymbolHookResult::Failed) {
+            Trace(L"symbol retry %d: hooks failed, staying inactive", attempt);
+            return 0;
+        }
+
+        // Hooks registered while the mod unloads are discarded with it.
+        if (WaitForSingleObject(g_symbolRetryStop, 0) != WAIT_TIMEOUT) {
+            return 0;
+        }
+        Wh_ApplyHookOperations();
+        g_symbolsHooked.store(true, std::memory_order_release);
+        Trace(L"symbol retry %d: hooked", attempt);
+        ForEachTaskbarOnUiThread(ApplyInitialStateOnUiThread);
+        return 0;
+    }
+    Trace(L"symbol retry: giving up");
+    return 0;
+}
+
+bool StartSymbolRetry() {
+    g_symbolRetryStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_symbolRetryStop) {
+        return false;
+    }
+    g_symbolRetryThread =
+        CreateThread(nullptr, 0, SymbolRetryThread, nullptr, 0, nullptr);
+    if (!g_symbolRetryThread) {
+        CloseHandle(g_symbolRetryStop);
+        g_symbolRetryStop = nullptr;
+        return false;
+    }
     return true;
+}
+
+void StopSymbolRetry() {
+    if (g_symbolRetryThread) {
+        SetEvent(g_symbolRetryStop);
+        WaitForSingleObject(g_symbolRetryThread, INFINITE);
+        CloseHandle(g_symbolRetryThread);
+        g_symbolRetryThread = nullptr;
+    }
+    if (g_symbolRetryStop) {
+        CloseHandle(g_symbolRetryStop);
+        g_symbolRetryStop = nullptr;
+    }
 }
 
 }  // namespace
@@ -2916,9 +3032,19 @@ BOOL Wh_ModInit() {
               GetLastError());
     }
 
-    if (!HookTaskbarSymbols()) {
+    g_symbolsHooked.store(false, std::memory_order_release);
+    const SymbolHookResult symbols = HookTaskbarSymbols();
+    if (symbols == SymbolHookResult::Failed) {
         Trace(L"symbol hooks failed");
         return FALSE;
+    }
+    if (symbols == SymbolHookResult::Unavailable) {
+        if (!StartSymbolRetry()) {
+            return FALSE;
+        }
+        Trace(L"symbols unavailable, retrying in the background");
+    } else {
+        g_symbolsHooked.store(true, std::memory_order_release);
     }
 
     WindhawkUtils::SetFunctionHook(SetTimer, SetTimer_Hook, &SetTimer_Original);
@@ -2927,13 +3053,18 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
-    ForEachTaskbarOnUiThread(ApplyInitialStateOnUiThread);
+    if (g_symbolsHooked.load(std::memory_order_acquire)) {
+        ForEachTaskbarOnUiThread(ApplyInitialStateOnUiThread);
+    }
 }
 
 void Wh_ModBeforeUninit() {
     g_unloading.store(true, std::memory_order_release);
+    StopSymbolRetry();
 
-    ForEachTaskbarOnUiThread(CleanupTaskbarOnUiThread);
+    if (g_symbolsHooked.load(std::memory_order_acquire)) {
+        ForEachTaskbarOnUiThread(CleanupTaskbarOnUiThread);
+    }
 
     Trace(L"cleanup complete");
 }

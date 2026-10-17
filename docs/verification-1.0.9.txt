@@ -1,0 +1,53 @@
+Floating Dock 1.0.9 focused verification
+Date: 2026-10-17
+Baseline: 1.0.8, 69eaa5c
+Environment: Windows build 26200.9711 (after KB5127690); primary bottom
+taskbar, 2880 x 1800 at 175% (laptop).
+
+Reported problem
+After a Windows update and restart the dock had lost its animation.
+
+Root cause
+The update replaced taskbar.dll (new Taskbar.pdb id DAB69A79...1). Windhawk
+had not downloaded the new PDB after sign-in: the symbol cache had no folder
+for it, and Microsoft's symbol server returned it (HTTP 200). With no symbol
+resolved, HookTaskbarSymbols failed, Wh_ModInit returned FALSE and Windhawk
+kept both mods unloaded. Disabling and re-enabling both mods downloaded the
+PDB within seconds and both mods started. The symbols used by the mods are
+unchanged between the two builds (identical decorated names).
+
+Implementation (both mods)
+- HookTaskbarSymbols returns Hooked, Unavailable (HookSymbols failed and every
+  symbol pointer of the hook table is still null, so nothing was registered)
+  or Failed (partial resolution or taskbar.dll missing).
+- Unavailable: Wh_ModInit returns TRUE without hooks and starts a background
+  thread. It retries after 10 s, 30 s and 60 s, then every 120 s, for 62
+  attempts (about two hours). On success it calls Wh_ApplyHookOperations and
+  then applies the initial state on the taskbar UI thread (Motion:
+  ApplyInitialStateOnUiThread; Helpers: StartOnUiThread). Failed still makes
+  Wh_ModInit return FALSE.
+- Wh_ModBeforeUninit signals and joins the thread before cleanup, and skips
+  the UI cleanup when nothing was hooked. Helpers joins outside its lock
+  because the thread may be waiting on the UI thread.
+- Helpers: a failed SystemTray.dll lookup for the tray click hooks starts the
+  same thread, which retries the lookup. The tray click flags became atomics.
+- Motion's SetTimer hook (auto-hide delays) is registered in either case.
+- Motion: RecordTaskbarImage clears its section list before refilling it.
+
+Checks (test builds that report Unavailable for the first two taskbar
+lookups and fail the first tray click lookup)
+1. Init: both mods logged "symbols unavailable, retrying in the background".
+   Before the retry the taskbar revealed with Windows' own behavior.
+2. Retry 1 (10 s): Helpers hooked the tray clicks; taskbar still pending.
+3. Retry 2 (40 s): both mods hooked; Motion logged the TrayUI interface
+   (+8, slot 30) and its load state, Helpers placed the grouped layout and
+   started. A center reveal and an x=300 edge reveal then used the 460 ms
+   reveal with the scale pop; hot corners were sized.
+4. Reload 4 s after init, while the first retry was pending: both mods
+   cleaned up at once, Explorer kept its PID, and 1.0.9 loaded normally.
+5. Normal 1.0.9 build: loads hooked on the first attempt; reveals animate.
+
+Not covered
+- A real network outage at sign-in was simulated, not reproduced.
+- ShellHost's Quick Settings Escape hooks (ControlCenter.dll) keep their
+  existing behavior: they are retried when ControlCenter.dll loads.
